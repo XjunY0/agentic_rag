@@ -1,0 +1,32 @@
+max_turns: 2
+top_k: 100
+rrf_k: 60
+llm_concurrency: 24
+concept_bonus: 0.0025
+weights:
+  bm25: 0.5
+  vector: 0.8
+  entity: 0.2
+  ontology: 1.0
+
+faiss:
+  hnsw_m: 32
+  ef_construction: 200
+  ef_search: 64
+
+spacy:
+  model: en_core_web_lg
+ontology:
+  split_threshold: 60
+  max_depth: 4
+  max_k_children: 3
+  sample_docs_for_split: 10
+  min_level_for_mount: 2
+  top_k_recall: 20
+  top_k_mount: 2
+  search_top_k_nodes: 20
+  concurrency: 24
+  batch_size: 64
+  min_cluster_k: 10
+  max_cluster_k: 60
+  min_docs_to_split: 100

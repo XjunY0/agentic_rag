@@ -1,0 +1,10 @@
+defaults:
+  - model: qwen
+  - dataset: 2wiki
+  - search: default
+  - _self_
+
+storage:
+  path: ${hydra:runtime.cwd}/storage/${dataset.name}
+
+output_dir: ${hydra:runtime.cwd}/outputs/${dataset.name}
