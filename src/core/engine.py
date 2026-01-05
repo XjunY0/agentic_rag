@@ -16,6 +16,7 @@ from ..verifier.verifier import Verifier
 from ..verifier.reflector import Reflector
 from ..utils.logger import setup_logger
 from ..io.data_loader import DataLoader
+from .resources import ResourceManager
 
 logger = setup_logger(__name__)
 
@@ -25,6 +26,10 @@ class OmniSearch:
     """
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        
+        # Initialize Resource Manager
+        ResourceManager.setup(config.get('resources', {}))
+        
         self.corpus = {} # Map of doc_id -> text
         self.storage_dir = config['storage']['path']
         

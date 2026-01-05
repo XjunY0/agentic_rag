@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
 from .base import BaseLLMClient
 from ..utils.logger import setup_logger
+from ..core.resources import ResourceManager
 
 logger = setup_logger(__name__)
 
@@ -12,26 +13,10 @@ class RemoteLLMClient(BaseLLMClient):
     def __init__(self, api_key: str, base_url: str, model: str, **kwargs):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
-        # concurrency control (lazy per event loop)
-        self._sem = None
-        self._sem_loop = None
-        # allow override from kwargs
-        self._max_concurrency = int(kwargs.get("max_concurrency", 16))
+        # concurrency control handled by ResourceManager
 
     async def chat(self, messages: List[Dict[str, str]], max_retries: int = 3, **kwargs) -> str:
-        # ensure semaphore bound to current running loop
-        loop = None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        sem = getattr(self, "_sem", None)
-        sem_loop = getattr(self, "_sem_loop", None)
-        if sem is None or sem_loop is not loop:
-            self._sem = asyncio.Semaphore(self._max_concurrency)
-            self._sem_loop = loop
-            sem = self._sem
+        sem = ResourceManager.get_instance().llm_semaphore
 
         last_err = None
         for attempt in range(max_retries):

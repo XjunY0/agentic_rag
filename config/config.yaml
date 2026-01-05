@@ -4,6 +4,10 @@ defaults:
   - search: default
   - _self_
 
+resources:
+  global_llm_concurrency: 24
+  global_gpu_concurrency: 1
+
 storage:
   path: ${hydra:runtime.cwd}/storage/${dataset.name}
 

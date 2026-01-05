@@ -358,6 +358,8 @@ class OntologyIndex:
         self.index_path = index_path
         self.config = config or {}
         self.root = TreeNode("Root", 1)
+        self.search_index = None
+        self.search_node_ids = []
 
     async def build(self, corpus: List[Dict[str, Any]], llm: BaseLLMClient, embedder: BaseEmbeddingModel, doc_vecs: Optional[Any] = None, force: bool = False):
         if os.path.exists(self.index_path) and not force:
@@ -436,6 +438,28 @@ class OntologyIndex:
         # 4. Clean tree
         self.clean_tree()
         
+        # 5. Build Search Index (Static for now)
+        logger.info("Building static search index for ontology...")
+        nodes = self.get_all_nodes()
+        # Filter nodes that are useful for search (e.g. have docs attached)
+        self.search_node_ids = [n.node_id for n in nodes if n.doc_ids and n.level > 1]
+        
+        if self.search_node_ids:
+            nodes_map = {n.node_id: n for n in nodes}
+            target_nodes = [nodes_map[nid] for nid in self.search_node_ids]
+            texts = [n.embedding_text() for n in target_nodes]
+            
+            encode_fn = getattr(embedder, "encode_async", None)
+            if encode_fn:
+                vecs = await encode_fn(texts)
+            else:
+                vecs = await asyncio.to_thread(embedder.encode, texts)
+            
+            vecs = np.ascontiguousarray(vecs)
+            faiss.normalize_L2(vecs)
+            self.search_index = faiss.IndexFlatIP(vecs.shape[1])
+            self.search_index.add(vecs)
+        
         self.save()
         if classifier.index:
             classifier.index.save(self.index_path + ".faiss")
@@ -444,11 +468,26 @@ class OntologyIndex:
     def save(self):
         with open(self.index_path, "w", encoding="utf-8") as f:
             json.dump(self.root.to_dict(), f, ensure_ascii=False, indent=2)
+            
+        # Save search index meta
+        if self.search_node_ids:
+            with open(self.index_path + ".meta", "w", encoding="utf-8") as f:
+                json.dump(self.search_node_ids, f)
+            
+            if self.search_index:
+                faiss.write_index(self.search_index, self.index_path + ".search.faiss")
 
     def load(self):
         with open(self.index_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             self.root = TreeNode.from_dict(data)
+            
+        if os.path.exists(self.index_path + ".meta"):
+            with open(self.index_path + ".meta", "r") as f:
+                self.search_node_ids = json.load(f)
+        
+        if os.path.exists(self.index_path + ".search.faiss"):
+            self.search_index = faiss.read_index(self.index_path + ".search.faiss")
 
     def clean_tree(self, node: Optional[TreeNode] = None):
         if node is None:
@@ -471,21 +510,10 @@ class OntologyIndex:
 
     async def search(self, query: str, embedder: BaseEmbeddingModel, llm: BaseLLMClient, top_k_nodes: int = 20) -> List[Dict[str, Any]]:
         """Search for relevant documents via ontology nodes."""
-        nodes = self.get_all_nodes()
-        if not nodes: return []
+        if not self.search_index or not self.search_node_ids:
+            return []
         
-        nodes_with_docs = [n for n in nodes if n.doc_ids and n.level > 1]
-        if not nodes_with_docs: return []
-        
-        node_texts = [n.embedding_text() for n in nodes_with_docs]
         encode_fn = getattr(embedder, "encode_async", None)
-        if encode_fn is None:
-            node_vecs = await asyncio.to_thread(embedder.encode, node_texts)
-        else:
-            node_vecs = await encode_fn(node_texts)
-        node_vecs = np.ascontiguousarray(node_vecs)
-        faiss.normalize_L2(node_vecs)
-
         if encode_fn is None:
             query_vec = await asyncio.to_thread(embedder.encode, [query])
         else:
@@ -493,15 +521,15 @@ class OntologyIndex:
         query_vec = np.ascontiguousarray(query_vec)
         faiss.normalize_L2(query_vec)
         
-        index = faiss.IndexFlatIP(node_vecs.shape[1])
-        index.add(node_vecs)
+        scores, indices = self.search_index.search(query_vec, min(top_k_nodes, len(self.search_node_ids)))
         
-        scores, indices = index.search(query_vec, min(top_k_nodes, len(nodes_with_docs)))
-        
+        all_nodes = {n.node_id: n for n in self.get_all_nodes()}
         candidates = []
-        for i, idx in enumerate(indices[0]):
-            if idx != -1:
-                candidates.append(nodes_with_docs[idx])
+        for idx in indices[0]:
+            if idx != -1 and idx < len(self.search_node_ids):
+                nid = self.search_node_ids[idx]
+                if nid in all_nodes:
+                    candidates.append(all_nodes[nid])
         
         if not candidates: return []
         
