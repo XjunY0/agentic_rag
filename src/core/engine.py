@@ -107,7 +107,14 @@ class OmniSearch:
             else:
                 doc_vecs = await encode_fn(texts)
 
-        await self.ontology_index.build(corpus, self.llm_client, self.embedding_model, doc_vecs=doc_vecs)
+        force_rebuild_ontology = bool(self.config.get('storage', {}).get('force_rebuild_ontology', False))
+        await self.ontology_index.build(
+            corpus,
+            self.llm_client,
+            self.embedding_model,
+            doc_vecs=doc_vecs,
+            force=force_rebuild_ontology,
+        )
 
     async def search(self, query: str, request_id: Optional[str] = None) -> Dict[str, Any]:
         """Perform agentic multi-turn search."""
@@ -116,6 +123,7 @@ class OmniSearch:
         all_evidences = []
         all_doc_ids = set()
         trace_queries: List[str] = []
+        ontology_traces: List[Dict[str, Any]] = []
         
         while turn < self.max_turns:
             logger.info(f"Turn {turn + 1}: Planning for query: {current_query}")
@@ -144,6 +152,8 @@ class OmniSearch:
 
                 verification = await self.verifier.verify(sub_q, docs_for_verify)
                 verification["sub_query"] = sub_q
+                if multi_results.get("ontology_trace"):
+                    verification["ontology_trace"] = multi_results["ontology_trace"]
                 return verification
 
             tasks = [_process_subq(sq) for sq in sub_queries]
@@ -152,6 +162,13 @@ class OmniSearch:
             for verification in turn_results:
                 all_evidences.extend(verification.get("evidences_chain", []))
                 all_doc_ids.update(verification.get("keep_ids", []))
+                ontology_trace = verification.get("ontology_trace")
+                if ontology_trace:
+                    ontology_traces.append({
+                        "turn": turn + 1,
+                        "sub_query": verification.get("sub_query"),
+                        "trace": ontology_trace,
+                    })
             
             # Reflect on the current turn's results using the query that was planned/executed this turn
             # Provide original query, current (rewritten) query, verifier results and accumulated evidences
@@ -177,7 +194,8 @@ class OmniSearch:
                     "evidences": all_evidences,
                     "thought": reflection.get("thought"),
                     "doc_ids": list(all_doc_ids),
-                    "turns": turn + 1
+                    "turns": turn + 1,
+                    "ontology_traces": ontology_traces,
                 }
             # Update current_query to the new query suggested by reflector (defaults to previous current_query)
             current_query = reflection.get("new_query", current_query)
@@ -202,5 +220,6 @@ class OmniSearch:
             "evidences": all_evidences,
             "thought": reflection.get("thought"),
             "doc_ids": list(all_doc_ids),
-            "turns": turn
+            "turns": turn,
+            "ontology_traces": ontology_traces,
         }

@@ -28,7 +28,7 @@ class QwenEmbeddingModel(BaseEmbeddingModel):
             model_name,
             trust_remote_code=True,
             attn_implementation=attn_implementation,
-            torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
+            torch_dtype=torch.float16 if "cuda" in self.device else torch.float32
         ).to(self.device)
         
         self.max_length = max_length
@@ -54,7 +54,7 @@ class QwenEmbeddingModel(BaseEmbeddingModel):
     def encode(self, texts: List[str], is_query: bool = False, instruction: Optional[str] = None) -> Any:
         if isinstance(texts, str):
             texts = [texts]
-        
+
         if is_query:
             texts = [self.format_query(t, instruction) for t in texts]
 
@@ -64,6 +64,10 @@ class QwenEmbeddingModel(BaseEmbeddingModel):
         embeddings = self.last_token_pool(outputs.last_hidden_state, inputs['attention_mask'])
         embeddings = F.normalize(embeddings, p=2, dim=1)
         arr = embeddings.cpu().numpy().astype("float32")
+
+        # Clear GPU cache to prevent memory buildup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # enforce target_dim if configured
         if self.target_dim is not None:

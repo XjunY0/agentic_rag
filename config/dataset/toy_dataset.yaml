@@ -1,0 +1,2 @@
+name: toy_dataset
+path: ${hydra:runtime.cwd}/datasets/toy_dataset

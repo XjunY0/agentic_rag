@@ -1,8 +1,7 @@
 import numpy as np
 import asyncio
-import json
 import faiss
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 from .ontology_index import TreeNode
 from ..models.base import BaseLLMClient, BaseEmbeddingModel
@@ -90,7 +89,8 @@ class TreeBuilder:
         min_cluster_k: int = 10,
         max_cluster_k: int = 60,
         min_docs_to_split: int = 100,
-        concurrency: int = 16
+        concurrency: int = 16,
+        sample_docs_for_split: int = 10,
     ):
         self.llm = llm
         self.embedder = embedder
@@ -98,6 +98,7 @@ class TreeBuilder:
         self.min_cluster_k = min_cluster_k
         self.max_cluster_k = max_cluster_k
         self.min_docs_to_split = min_docs_to_split
+        self.sample_docs_for_split = sample_docs_for_split
         # Semaphore created lazily per event loop to avoid binding to wrong loop
         self._sem = None
         self._concurrency = concurrency
@@ -120,7 +121,9 @@ class TreeBuilder:
         k = min(self.max_cluster_k, k)
         if N <= 50:
             k = 4
-        return k
+        max_reasonable = max(2, N // 6)
+        k = min(k, max_reasonable)
+        return max(2, k)
 
     async def build_layer(self, docs: List[str], ids: List[str], X: np.ndarray, depth: int, parent_chain: List[str]) -> TreeNode:
         current_name = parent_chain[-1]
@@ -142,7 +145,12 @@ class TreeBuilder:
 
         # 1. Clustering
         labels, _ = KMeans(raw_k).run(X)
-        reps = Selector.medoids(X, labels, top_k=5)
+        reps = Selector.medoids(X, labels, top_k=min(self.sample_docs_for_split, 8))
+        cluster_sizes = {
+            int(cid): int(np.sum(labels == cid))
+            for cid in np.unique(labels)
+            if cid != -1
+        }
 
         cluster_samples = {
             cid: [docs[i] for i in idx_list]
@@ -157,7 +165,8 @@ class TreeBuilder:
             sample_text = "\n\n".join([s[:500] for s in samples])
             prompt = PromptManager.get_prompt('TREE_GEN_TOPIC').format(
                 parent_path=parent_path,
-                sample_text=sample_text
+                sample_text=sample_text,
+                cluster_doc_count=cluster_sizes.get(cid, len(samples)),
             )
             sem = self._ensure_sem()
             async with sem:
@@ -167,79 +176,46 @@ class TreeBuilder:
                 data = parse_llm_json(res) or {}
                 name = data.get("name", f"Subtopic {cid}")
                 desc = data.get("description", "")
-                raw_topics.append({"name": name, "description": desc, "cid": cid})
+                raw_topics.append({
+                    "name": name,
+                    "description": desc,
+                    "cid": cid,
+                    "doc_count": cluster_sizes.get(cid, 0),
+                })
             except Exception as e:
                 logger.warning(f"Failed to parse topic for cluster {cid}: {e}")
-                raw_topics.append({"name": f"Subtopic {cid}", "description": "", "cid": cid})
+                raw_topics.append({
+                    "name": f"Subtopic {cid}",
+                    "description": "",
+                    "cid": cid,
+                    "doc_count": cluster_sizes.get(cid, 0),
+                })
 
-        # logger.info(f"Depth {depth}: Generated {len(raw_topics)} raw topics for {parent_path}")
+        if len(raw_topics) <= 1:
+            node.doc_ids = ids
+            return node
 
-        # 3. Merge raw topics into broader categories
-        prompt_merge = PromptManager.get_prompt('TREE_MERGE_CATEGORIES').format(
-            depth=depth + 1,
-            parent_path=parent_path,
-            raw_topics_json=json.dumps(raw_topics, indent=2)
-        )
-        sem = self._ensure_sem()
-        async with sem:
-            res_merge = await self.llm.chat([{"role": "user", "content": prompt_merge}], response_format={"type": "json_object"})
-        try:
-            merged = parse_llm_json(res_merge)
-            if not isinstance(merged, list):
-                if isinstance(merged, dict) and "categories" in merged:
-                    merged = merged["categories"]
-                else:
-                    raise ValueError("Merged result is not a list")
-        except Exception:
-            # Fallback: treat each raw topic as a separate merged group
-            merged = [{"name": t["name"], "description": t["description"], "member_names": [t["name"]]} for t in raw_topics]
-
-        merged_names = [m["name"] for m in merged]
-        merged_descs = [m["description"] for m in merged]
-        
-        # logger.info(f"Depth {depth}: Merged into {len(merged_names)} categories for {parent_path}")
-
-        # 4. Embedding merged categories (Sequential to match SelectRAG)
+        cat_names = [topic["name"] for topic in raw_topics]
+        cat_descs = [topic["description"] for topic in raw_topics]
+        encode_fn = getattr(self.embedder, "encode_async", None)
         cat_embs_list = []
-        for i in tqdm(range(len(merged_names)), desc="Embedding merged categories"):
-            text = f"{merged_names[i]} — {merged_descs[i]}"
-            emb = await self.embedder.encode_async([text])
+        for i in tqdm(range(len(cat_names)), desc="Embedding topic names"):
+            text = f"{cat_names[i]} — {cat_descs[i]}"
+            if encode_fn is None:
+                emb = await asyncio.to_thread(self.embedder.encode, [text])
+            else:
+                emb = await encode_fn([text])
             cat_embs_list.append(emb[0])
         cat_embs = np.vstack(cat_embs_list)
         faiss.normalize_L2(cat_embs)
 
-        # 5. Map raw topics to merged categories
-        raw_names = [rt["name"] for rt in raw_topics]
-        raw_embs_list = []
-        for name in tqdm(raw_names, desc="Embedding raw topics"):
-            emb = await self.embedder.encode_async([name])
-            raw_embs_list.append(emb[0])
-        raw_embs = np.vstack(raw_embs_list)
-        faiss.normalize_L2(raw_embs)
+        assignment, _ = Router.route(X, cat_embs)
+        valid_child_ids = [cid for cid in range(len(cat_names)) if np.any(assignment == cid)]
+        if len(valid_child_ids) <= 1:
+            node.doc_ids = ids
+            return node
 
-        raw_assign, raw_scores = Router.route(raw_embs, cat_embs, threshold=0.45)
-        # logger.info(f"Depth {depth}: Raw topic mapping scores: min={np.min(raw_scores):.4f}, avg={np.mean(raw_scores):.4f}")
-
-        # 6. Map each doc to merged category
-        assignment = np.full(N, -1, dtype=int)
-        for raw_cid, merged_cid in enumerate(raw_assign):
-            if merged_cid == -1: continue
-            doc_idx = np.where(labels == raw_cid)[0]
-            assignment[doc_idx] = merged_cid
-
-        # 7. Summarize node description
-        child_block = "\n".join([f"- {d}" for d in merged_descs if d])
-        if child_block:
-            prompt_summ = PromptManager.get_prompt('TREE_SUMMARIZE_NODE').format(
-                parent_path=parent_path,
-                child_block=child_block
-            )
-            sem = self._ensure_sem()
-            async with sem:
-                node.desc = await self.llm.chat([{"role": "user", "content": prompt_summ}])
-        
-        # 8. Recursive build
-        for cid in range(len(merged_names)):
+        for cid in valid_child_ids:
             idx = np.where(assignment == cid)[0]
             if len(idx) == 0:
                 continue
@@ -248,9 +224,10 @@ class TreeBuilder:
             sub_ids = [ids[i] for i in idx]
             sub_X = X[idx]
 
-            child_chain = parent_chain + [merged_names[cid]]
+            child_chain = parent_chain + [cat_names[cid]]
             child_node = await self.build_layer(sub_docs, sub_ids, sub_X, depth + 1, child_chain)
-            child_node.desc = merged_descs[cid]
+            if not child_node.desc:
+                child_node.desc = cat_descs[cid]
             node.add_child(child_node)
 
         # Documents not assigned to any child stay at this node

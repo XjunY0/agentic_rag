@@ -1,19 +1,17 @@
-max_turns: 2
+max_turns: 8
 top_k: 100
 rrf_k: 60
-llm_concurrency: 24
+llm_concurrency: 100
 concept_bonus: 0.0025
 weights:
   bm25: 0.5
   vector: 0.8
   entity: 0.2
   ontology: 1.0
-
 faiss:
   hnsw_m: 32
   ef_construction: 200
   ef_search: 64
-
 spacy:
   model: en_core_web_lg
 ontology:
@@ -24,9 +22,16 @@ ontology:
   min_level_for_mount: 2
   top_k_recall: 20
   top_k_mount: 2
-  search_top_k_nodes: 20
+  search_top_k_nodes: 40
+  include_desc_in_mount_prompt: true
+  include_desc_in_search_prompt: true
+  search_max_docs_per_node: 8
+  search_trace_enabled: true
+  search_node_similarity_weight: 0.15
+  search_doc_similarity_weight: 1.0
   concurrency: 24
   batch_size: 64
   min_cluster_k: 10
   max_cluster_k: 60
   min_docs_to_split: 100
+ontology_enabled: true

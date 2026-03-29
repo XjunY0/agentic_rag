@@ -66,11 +66,20 @@ class MultiModalRetriever:
 
         # unpack results
         bm25_results, vector_results, entity_results = gathered[0], gathered[1], gathered[2]
-        ontology_results = gathered[3] if use_ontology and len(gathered) > 3 else []
+        ontology_results = []
+        ontology_trace = None
+        if use_ontology and len(gathered) > 3:
+            ontology_payload = gathered[3]
+            if isinstance(ontology_payload, dict):
+                ontology_results = ontology_payload.get("results", []) or []
+                ontology_trace = ontology_payload.get("trace")
+            else:
+                ontology_results = ontology_payload or []
 
         return {
             "bm25": bm25_results,
             "vector": vector_results,
             "entity": entity_results,
-            "ontology": ontology_results
+            "ontology": ontology_results,
+            "ontology_trace": ontology_trace,
         }

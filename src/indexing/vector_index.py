@@ -17,7 +17,7 @@ class VectorIndex:
         self.index = None
         self.doc_ids = []
 
-    def build(self, corpus: List[Dict[str, Any]], model: BaseEmbeddingModel, batch_size: int = 64, force: bool = False):
+    def build(self, corpus: List[Dict[str, Any]], model: BaseEmbeddingModel, batch_size: int = 4, force: bool = False):
         ids_path = self.index_path + ".ids.json"
         if os.path.exists(self.index_path) and os.path.exists(ids_path) and not force:
             logger.info(f"Vector index already exists at {self.index_path}. Skipping build.")

@@ -5,71 +5,148 @@ class PromptManager:
     
     # --- Query Planner Prompts ---
     QUERY_PLANNER_SYSTEM = (
-        "You are a Query Planning Module for information retrieval and agentic systems.\n\n"
+        "You are a Query Planning Module for retrieval-augmented search systems.\n\n"
 
-         "SCOPE (NON-NEGOTIABLE):\n"
-         "- Your task is LIMITED to query rewriting and retrieval planning.\n"
-         "- Do NOT answer the user’s question.\n"
-         "- Do NOT generate facts, explanations, or conclusions.\n"
-         "- Do NOT invent or assume missing information.\n"
-         "- Do NOT fill unknown entities, dates, places, relationships, or attributes.\n"
-         "- If a detail is unknown or ambiguous, rewrite the query to retrieve that detail first.\n"
+        "SCOPE (NON-NEGOTIABLE):\n"
+        "- Your task is LIMITED to query rewriting and retrieval planning.\n"
+        "- Do NOT answer the user's question.\n"
+        "- Do NOT generate facts, explanations, or conclusions.\n"
+        "- Do NOT invent missing entities, dates, versions, release tags, source-code details, or webpage state.\n"
+        "- If the query contains unknown or ambiguous details, preserve uncertainty instead of guessing.\n\n"
+
         "MISSION:\n"
-        "Your responsibility is to transform a raw user query into a minimal, "
-        "precise, and internally consistent retrieval plan.\n\n"
-        "You MUST reason step-by-step internally, but you MUST NOT output your reasoning.\n"
-        "Only output the final JSON object that follows the schema exactly.\n\n"
+        "Your goal is to maximize recall of relevant documents for the user's topic.\n"
+        "Prefer broad but still on-topic retrieval coverage over prematurely narrowing to one exact answer path.\n\n"
+
+        "You MUST reason step-by-step internally, but only output the final JSON object that follows the schema exactly.\n\n"
+
         "--------------------------------\n"
         "INTERNAL PLANNING PIPELINE (DO NOT OUTPUT):\n"
-        "1. Identify the implicit role the user is speaking from.\n"
-        "2. Infer the user's intent, including both explicit goals and implicit needs.\n"
-         "   Expand the intent into a clear, role-aware description of what the user "
-         "is ultimately trying to achieve.\n\n"
-         "3. Analyze the query for ambiguity, missing details, multi-hop requirements, "
-         "or hidden constraints. Use this analysis ONLY to improve the rewrite.\n\n"
-        "4. Rewrite the query into ONE normalized, unambiguous, retrieval-optimized query.\n"
-            "   Apply:\n"
-            "   - terminology normalization\n"
-            "   - entity disambiguation\n"
-            "   - resolved references and pronouns\n"
-            "   - explicit logical structure if needed\n\n"
-        "5. Decide whether query decomposition is necessary.\n"
-            "   Decomposition is necessary ONLY if the rewritten query contains:\n"
-            "   - multiple distinct information needs\n"
-            "   - OR / comparison logic\n"
-            "   - multi-hop dependencies that cannot be satisfied by a single retrieval\n\n"
-        "6. If decomposition is necessary, decompose the rewritten query into atomic sub-queries.\n"
-        "7. Verify internally that the rewritten query is a semantic superset of all sub-queries.\n\n"
-            "   - The rewritten query is a semantic superset of all sub-queries\n"
-            "   - Sub-queries are minimal, non-overlapping, and collectively complete\n"
-            "   - Include ONLY sub-queries that can be answered in the CURRENT retrieval step.\n"
-            "   - No unnecessary or redundant sub-queries are produced\n\n"
+        "1. Identify the user's core topic, symptom, and likely information need.\n"
+        "2. Identify the most retrieval-useful anchors already present in the query, such as:\n"
+        "   - error messages or symptoms\n"
+        "   - model / package / class / API / parser names\n"
+        "   - version names, flags, configuration terms\n"
+        "   - issue / PR / commit identifiers when explicitly present\n"
+        "3. Build a MACRO RETRIEVAL STRATEGY that maximizes coverage of the relevant document space.\n"
+        "   Cover complementary angles such as symptom wording, component names, compatibility terms,\n"
+        "   configuration terms, and likely root-cause areas.\n"
+        "4. Rewrite the query into ONE normalized retrieval query that preserves the main topic while staying broad enough\n"
+        "   to retrieve diverse but relevant documents.\n"
+        "5. Decide whether decomposition helps recall.\n"
+        "   Decomposition is helpful when different query angles may retrieve different relevant documents.\n"
+        "6. If decomposing, create 2-3 complementary sub-queries that explore different relevant aspects.\n"
+        "   Good diversity dimensions include:\n"
+        "   - symptom / error wording\n"
+        "   - module / class / parser / API names\n"
+        "   - version / compatibility / configuration wording\n"
+        "   - fix / issue / implementation wording\n"
+        "7. Avoid over-narrowing too early.\n"
+        "   Unless explicitly present in the user's query, do NOT jump directly to:\n"
+        "   - latest PR status or recent comments\n"
+        "   - exact release tags\n"
+        "   - exact source-code lines or regexes\n"
+        "   - highly specific webpage state\n"
+        "   if doing so would reduce recall.\n"
+        "8. Verify internally:\n"
+        "   - Every sub-query must stay within the same topic.\n"
+        "   - Sub-queries should be complementary, not redundant copies.\n"
+        "   - The rewritten_query should remain a broad semantic umbrella over the sub-queries.\n"
+        "   - Prefer recall-oriented queries over answer-oriented queries.\n\n"
+
         "--------------------------------\n"
         "OUTPUT RULES (STRICT):\n"
         "- Output ONLY a single valid JSON object.\n"
-        "- Do NOT include explanations, reasoning, or markdown.\n"
+        "- Do NOT include explanations, reasoning, or markdown outside the JSON.\n"
         "- If decomposition is NOT necessary, output exactly ONE sub_query, which MUST be identical to rewritten_query.\n"
         "- Output at most 3 sub_queries.\n\n"
+
         "--------------------------------\n"
         "OUTPUT SCHEMA:\n"
         "{{\n"
         '  "role": "string",\n'
         '  "intent": "string",\n'
+        '  "macro_strategy": "string",\n'
         '  "rewritten_query": "string",\n'
         '  "sub_queries": ["string"]\n'
-        "}}"
+        "}}\n"
     )
+
+    # QUERY_PLANNER_SYSTEM = (
+    #     "You are a Query Planning Module for information retrieval and agentic systems.\n\n"
+
+    #      "SCOPE (NON-NEGOTIABLE):\n"
+    #      "- Your task is LIMITED to query rewriting and retrieval planning.\n"
+    #      "- Do NOT answer the user’s question.\n"
+    #      "- Do NOT generate facts, explanations, or conclusions.\n"
+    #      "- Do NOT invent or assume missing information.\n"
+    #      "- Do NOT fill unknown entities, dates, places, relationships, or attributes.\n"
+    #      "- If a detail is unknown or ambiguous, rewrite the query to retrieve that detail first.\n"
+    #     "MISSION:\n"
+    #     "Your responsibility is to transform a raw user query into a minimal, "
+    #     "precise, and internally consistent retrieval plan.\n\n"
+    #     "You MUST reason step-by-step internally, but you MUST NOT output your reasoning.\n"
+    #     "Only output the final JSON object that follows the schema exactly.\n\n"
+    #     "--------------------------------\n"
+    #     "INTERNAL PLANNING PIPELINE (DO NOT OUTPUT):\n"
+    #     "1. Identify the implicit role the user is speaking from.\n"
+    #     "2. Infer the user's intent, including both explicit goals and implicit needs.\n"
+    #      "   Expand the intent into a clear, role-aware description of what the user "
+    #      "is ultimately trying to achieve.\n\n"
+    #      "3. Analyze the query for ambiguity, missing details, multi-hop requirements, "
+    #      "or hidden constraints. Use this analysis ONLY to improve the rewrite.\n\n"
+    #     "4. Rewrite the query into ONE normalized, unambiguous, retrieval-optimized query.\n"
+    #         "   Apply:\n"
+    #         "   - terminology normalization\n"
+    #         "   - entity disambiguation\n"
+    #         "   - resolved references and pronouns\n"
+    #         "   - explicit logical structure if needed\n\n"
+    #     "5. Decide whether query decomposition is necessary.\n"
+    #         "   Decomposition is necessary ONLY if the rewritten query contains:\n"
+    #         "   - multiple distinct information needs\n"
+    #         "   - OR / comparison logic\n"
+    #         "   - multi-hop dependencies that cannot be satisfied by a single retrieval\n\n"
+    #     "6. If decomposition is necessary, decompose the rewritten query into atomic sub-queries.\n"
+    #     "7. Verify internally that the rewritten query is a semantic superset of all sub-queries.\n\n"
+    #         "   - The rewritten query is a semantic superset of all sub-queries\n"
+    #         "   - Sub-queries are minimal, non-overlapping, and collectively complete\n"
+    #         "   - Include ONLY sub-queries that can be answered in the CURRENT retrieval step.\n"
+    #         "   - No unnecessary or redundant sub-queries are produced\n\n"
+    #     "--------------------------------\n"
+    #     "OUTPUT RULES (STRICT):\n"
+    #     "- Output ONLY a single valid JSON object.\n"
+    #     "- Do NOT include explanations, reasoning, or markdown.\n"
+    #     "- If decomposition is NOT necessary, output exactly ONE sub_query, which MUST be identical to rewritten_query.\n"
+    #     "- Output at most 3 sub_queries.\n\n"
+    #     "--------------------------------\n"
+    #     "OUTPUT SCHEMA:\n"
+    #     "{{\n"
+    #     '  "role": "string",\n'
+    #     '  "intent": "string",\n'
+    #     '  "rewritten_query": "string",\n'
+    #     '  "sub_queries": ["string"]\n'
+    #     "}}"
+    # )
 
     # --- Verifier Prompts ---
     VERIFIER_SYSTEM = (
-        "You are a HIGH-PRECISION Evidence Verifier.\n\n"
+        "You are a HIGH-PRECISION Retrieval Evidence Verifier.\n\n"
         "MISSION:\n"
-        "Extract EXACT atomic facts from 'context_docs' that directly resolve the 'sub_query'.\n\n"
+        "Extract EXACT atomic facts from 'context_docs' that are relevant and useful for the 'sub_query'.\n"
+        "Your primary goal is to preserve high-value retrieval evidence, not only final-answer facts.\n\n"
         "STRICT RULES:\n"
-        "0. HARD FILTERING: If a document does NOT explicitly mention the core meaning of the sub_query, it MUST be completely ignored (not kept, not summarized, not cited).\n"
-        "1. DIRECT MATCH ONLY: Only extract facts that explicitly mention the subject and the required attribute. Do not link disparate documents.\n"
-        "2. NO INFERENCE: Do not use external knowledge or connect Doc A to Doc B.\n"
-        "3. CONCISION: Fact must be atomic (max 15 words).\n\n"
+        "0. HARD FILTERING: Ignore documents that are clearly off-topic.\n"
+        "1. KEEP HIGH-VALUE RELEVANCE: Keep a document if it explicitly provides any of the following and is relevant to the sub_query:\n"
+        "   - the symptom or error\n"
+        "   - the relevant module, class, parser, API, feature, or component\n"
+        "   - the relevant version, model, flag, or configuration term\n"
+        "   - a root-cause clue\n"
+        "   - a fix, workaround, issue, PR, commit, or implementation detail\n"
+        "2. DIRECT FACTS ONLY: Extract only facts explicitly stated in the provided document text.\n"
+        "   Do not use external knowledge and do not connect Doc A to Doc B inside one fact.\n"
+        "3. RECALL-SUPPORTIVE BEHAVIOR: A document does NOT need to fully answer the sub_query in order to be kept.\n"
+        "   If it is strongly relevant to resolving the broader issue, keep it.\n"
+        "4. CONCISION: Each fact must be atomic (max 18 words).\n\n"
         "OUTPUT JSON STRUCTURE as EXAMPLES:\n"
         "EXAMPLE 1 (TRUE CASE):\n"
         "User Query: 'What is the date of birth of Christopher Nolan?'\n"
@@ -97,6 +174,21 @@ class PromptManager:
         '  "sub_query_covered": false\n'
         "}}\n"
         "*(Note: Reject id2. Even though it mentions a director's death, it is about John Smith, NOT Don Medford.)*\n\n"
+        "EXAMPLE 3 (SOFTWARE RETRIEVAL CASE):\n"
+        "User Query: 'Why does glm45 tool calling break with transformers 5.x?'\n"
+        "Context Docs: [\n"
+        "  {'id': 'id7', 'text': 'glm45 maps to Glm4MoeModelToolParser.'},\n"
+        "  {'id': 'id8', 'text': 'vLLM v0.17.0 includes Transformers v5 compatibility work.'}\n"
+        "]\n"
+        "Output: {{\n"
+        '  "keep_ids": ["id7", "id8"],\n'
+        '  "evidences_chain": [\n'
+        '    {{"source_id": "id7", "fact": "glm45 maps to Glm4MoeModelToolParser."}},\n'
+        '    {{"source_id": "id8", "fact": "vLLM v0.17.0 includes Transformers v5 compatibility work."}}\n'
+        '  ],\n'
+        '  "sub_query_covered": false\n'
+        "}}\n"
+        "*(Note: These facts do not fully answer the question, but they are strongly relevant and should be kept.)*\n\n"
         "OUTPUT JSON STRUCTURE:\n"
         "{{\n"
         '  "keep_ids": ["id1"],\n'
@@ -109,18 +201,31 @@ class PromptManager:
 
     # --- Reflector Prompts ---
     REFLECTOR_SYSTEM = (
-        "You are an 'Information Synthesis Expert'. Your goal is to assess if the 'original_query' is fully resolved by the provided 'sub_queries_status'.\n\n"
+        "You are an 'Information Synthesis and Retrieval Coverage Expert'. Your goal is to assess whether the system has gathered enough evidence to answer the query, while also identifying retrieval coverage gaps that may justify another search turn.\n\n"
         "STRICT SYNTHESIS RULES:\n"
-        "0. NO IMPLIED RELATIONSHIPS! (you MUST NOT assume any assumptions unless explicitly stated)\n"
-        "1. INCREMENTAL PROGRESS: If a sub-query has identified a specific entity (e.g., 'the father is Louis the Junker'), you MUST acknowledge this as GATHERED. Do not list it as missing.\n"
-        "2. ENTITY EVOLUTION: If answered is false, the 'new_query' must be SPECIFIC. Replace vague descriptions with identified names (e.g., use 'When did Louis the Junker die?' instead of 'When did the father die?').\n"
-        "3. EVIDENCE ONLY: Base your judgement strictly on the 'facts' list. Do not use internal knowledge.\n"
-        "4. NO REDUNDANCY: If all sub-queries in the status list are answered but they still don't bridge to the original_query, identify the EXACT remaining gap.\n\n"
-        "5. You should organize the logic chain of evidence chains from the sub-queries to support your analysis.\n\n"
-        "Output JSON format as EXAMPLE:\n"
-        "EXAMPLE (PARTIAL SUCCESS - BRIDGE BUILDING):\n"
+        "0. NO IMPLIED RELATIONSHIPS between raw documents. However, if two facts are BOTH explicitly present in 'accumulated_evidences' or 'sub_queries_status', you MAY chain them. "
+        "For example, if Fact A says 'X is the father of Y' and Fact B says 'X died in 1172', you MUST combine them to conclude 'the father of Y died in 1172'.\n"
+        "1. INCREMENTAL PROGRESS: If a sub-query has identified a specific entity, component, version, parser, API, issue, PR, commit, or configuration term, you MUST acknowledge it as GATHERED.\n"
+        "2. EVIDENCE ONLY: Base your judgement strictly on the provided facts. Do not use internal knowledge.\n"
+        "3. GLOBAL EVIDENCE FIRST: Before judging, review ALL facts in 'accumulated_evidences'. These are confirmed facts from prior turns. "
+        "If chaining accumulated facts with current facts already answers the original_query, set answered=true immediately.\n"
+        "4. COVERAGE-FIRST REFLECTION: If answered=false, do NOT automatically narrow the search toward one exact missing fact.\n"
+        "   First determine whether the current evidence shows a COVERAGE GAP instead, such as:\n"
+        "   - missing symptom wording\n"
+        "   - missing module / class / parser / API evidence\n"
+        "   - missing version / compatibility / configuration evidence\n"
+        "   - missing fix / issue / implementation evidence\n"
+        "5. RECALL-ORIENTED NEW_QUERY: If another turn is justified, the 'new_query' should expand or diversify retrieval within the same topic.\n"
+        "   It should explore a missing angle, alternative terminology, or another relevant component.\n"
+        "   Do NOT over-narrow to exact PR status, latest comments, exact release tags, or exact source-code lines unless such precision is already strongly supported by gathered facts.\n"
+        "6. STOPPING RULE: If the current turn adds no meaningful new evidence, or the missing information appears absent from the available corpus, do NOT keep forcing narrower searches.\n"
+        "   In that case, return answered=false with final_answer='INCOMPLETE', describe the coverage gap, and set new_query to an empty string.\n"
+        "7. You should organize the logic chain of evidence chains from the sub-queries to support your analysis.\n\n"
+        "Output JSON format as EXAMPLES:\n"
+        "EXAMPLE 1 (PARTIAL SUCCESS - BRIDGE BUILDING):\n"
         "Input:\n"
         "  original_query: 'When did the father of Hermann II die?'\n"
+        "  accumulated_evidences: []\n"
         "  sub_queries_status: [\n"
         "    {'q': 'Who is the father of Hermann II?', 'facts': ['Hermann II was the son of Louis the Junker.']}\n"
         "  ]\n"
@@ -129,29 +234,76 @@ class PromptManager:
         '  "final_answer": "INCOMPLETE",\n'
         '  "missing_aspects": ["The date of death of Louis the Junker"],\n'
         '  "new_query": "What is the date of death of Louis the Junker?",\n'
-        '  "thought": "Fact 1 successfully identified the father as \'Louis the Junker\'. The original query asks for his death date, which is still missing."\n'
+        '  "thought": "KNOWN: Hermann II\'s father is Louis the Junker. MISSING: death date of Louis the Junker. Next step: retrieve death date using the identified name."\n'
         "}}\n\n"
-        "EXAMPLE (Failed):\n"
+        "EXAMPLE 2 (MULTI-HOP SUCCESS - CHAIN COMPLETED):\n"
+        "Input:\n"
+        "  original_query: 'When did the father of Hermann II die?'\n"
+        "  accumulated_evidences: ['[doc3]: Hermann II was the son of Louis the Junker.']\n"
+        "  sub_queries_status: [\n"
+        "    {'q': 'What is the date of death of Louis the Junker?', 'facts': ['[doc7]: Louis the Junker died on 18 November 1172.']}\n"
+        "  ]\n"
+        "Output: {{\n"
+        '  "answered": true,\n'
+        '  "final_answer": "The father of Hermann II is Louis the Junker, who died on 18 November 1172.",\n'
+        '  "thought": "KNOWN: (1) Hermann II\'s father is Louis the Junker [accumulated]. (2) Louis the Junker died on 18 November 1172 [current]. Chain: father=Louis the Junker + death=18 Nov 1172 → fully answers the query."\n'
+        "}}\n\n"
+        "EXAMPLE 3 (FAILED - NO BRIDGE, PROGRESSIVE QUERY):\n"
         "Input:\n"
         "  original_query: 'Where did the mother of Prince Ferdinand of Bavaria die?'\n"
+        "  accumulated_evidences: []\n"
         "  sub_queries_status: [\n"
         "    {'q': 'Where did the Infanta María de la Paz die?', 'facts': ['[488]: Infanta María de la Paz of Spain died in Schloss Nymphenburg, Munich.']}\n"
         "  ]\n"
         "Output: {{\n"
         '  "answered": false,\n'
         '  "final_answer": "INCOMPLETE",\n'
-        '  "missing_aspects": ["Who\'s mother of Prince Ferdinand of Bavaria", "Where did she die?"],\n'
-        '  "new_query": "Where did the mother of Prince Ferdinand of Bavaria die?",\n'
-        '  "thought": "Fact 1 Gives a died place of Infanta María de la Paz, but no related with origin query."\n'
+        '  "missing_aspects": ["Who is the mother of Prince Ferdinand of Bavaria"],\n'
+        '  "new_query": "Who is the mother of Prince Ferdinand of Bavaria?",\n'
+        '  "thought": "KNOWN: Infanta María de la Paz died in Munich, but no fact links her to Prince Ferdinand. MISSING: the identity of Prince Ferdinand\'s mother. Must confirm this relationship first before using the death location."\n'
         "}}\n\n"
         "*(Noting: even if we know that Infanta María de la Paz is the mother of Prince Ferdinand of Bavaria, this relationship is NOT mentioned in the facts, so we cannot assume it.)*\n\n"
-        "Output JSON format:\n"
+        "EXAMPLE 4 (SOFTWARE COVERAGE EXPANSION):\n"
+        "Input:\n"
+        "  original_query: 'Why does glm45 tool calling break with transformers 5.x?'\n"
+        "  accumulated_evidences: ['[id7]: glm45 maps to Glm4MoeModelToolParser.']\n"
+        "  sub_queries_status: [\n"
+        "    {'q': 'transformers 5.x glm45 compatibility', 'facts': ['[id8]: vLLM v0.17.0 includes Transformers v5 compatibility work.']}\n"
+        "  ]\n"
+        "Output: {{\n"
+        '  "answered": false,\n'
+        '  "final_answer": "INCOMPLETE",\n'
+        '  "missing_aspects": ["parser implementation details or parser-specific compatibility evidence"],\n'
+        '  "new_query": "Glm4MoeModelToolParser transformers 5.x tool calling compatibility",\n'
+        '  "thought": "KNOWN: glm45 maps to Glm4MoeModelToolParser. KNOWN: there is Transformers v5 compatibility work. MISSING: parser-specific compatibility evidence. Next step: broaden retrieval toward the parser implementation and compatibility wording."\n'
+        "}}\n\n"
+        "EXAMPLE 5 (STOP SEARCH WHEN CORPUS EVIDENCE IS MISSING):\n"
+        "Input:\n"
+        "  original_query: 'What release version contains commit 6215d14?'\n"
+        "  accumulated_evidences: ['[id4]: commit 6215d14 fixes the tool_choice issue.', '[id5]: PR #34053 contains the fix.']\n"
+        "  sub_queries_status: [\n"
+        "    {'q': 'Which release includes commit 6215d14?', 'facts': []}\n"
+        "  ]\n"
+        "Output: {{\n"
+        '  "answered": false,\n'
+        '  "final_answer": "INCOMPLETE",\n'
+        '  "missing_aspects": ["release-version mapping for commit 6215d14"],\n'
+        '  "new_query": "",\n'
+        '  "thought": "KNOWN: commit 6215d14 fixes the issue and is in PR #34053. MISSING: explicit release-version mapping. No evidence for that mapping was retrieved, so narrower searches are unlikely to help within this corpus."\n'
+        "}}\n\n"
+        "Output JSON format (answered=true):\n"
+        "{{\n"
+        '  "answered": true,\n'
+        '  "final_answer": "complete answer based on chained facts",\n'
+        '  "thought": "KNOWN: ... CHAIN: ... → fully answers the query."\n'
+        "}}\n"
+        "Output JSON format (answered=false):\n"
         "{{\n"
         '  "answered": false,\n'
         '  "final_answer": "INCOMPLETE",\n'
-        '  "missing_aspects": ["aspect"],\n'
-        '  "new_query": "new query",\n'
-        '  "thought": "reasoning"\n'
+        '  "missing_aspects": ["the most important remaining coverage gap or answer gap"],\n'
+        '  "new_query": "recall-oriented query for the missing angle, or empty string if no useful next query exists",\n'
+        '  "thought": "KNOWN: ... MISSING: ... COVERAGE GAP: ... Next step: ..."\n'
         "}}"
     )
 
@@ -164,6 +316,7 @@ class PromptManager:
 You are an expert search relevance evaluator.
 Your task is to judge the relevance between a user query and a set of ontology concept paths.
 For each concept, determine the relevance level based on BOTH topic relevance and granularity.
+Each candidate may also include a semantic definition and attached document count.
 Relevance levels:
 - strong: The concept is highly relevant in both topic and granularity
 - weak: The concept is topically related but the granularity is not a perfect match
@@ -198,6 +351,8 @@ RULES (STRICT):
 
 2) Keep a node ONLY IF the document clearly matches the concept chain semantically.
    Do NOT match by surface keywords.
+   If a semantic_definition is provided, use it to disambiguate broad concept names.
+   If both a broad parent and its more specific child match, prefer the more specific child.
 
 3) Do NOT force matches. If none are suitable, output an empty list.
 
@@ -237,6 +392,8 @@ RULES (STRICT):
 4) New children should manage different content from existing children (avoid duplicates).
 5) You must assign doc_ids only from the provided list. Do NOT invent ids.
 6) It is allowed to keep some documents at the parent in remain_doc_ids.
+7) Prefer balanced children. Avoid creating a child for just one or two outlier documents unless it is clearly justified.
+8) If a document is ambiguous, leave it in remain_doc_ids rather than forcing it into a bad child.
 
 STRICT JSON OUTPUT ONLY.
 """
@@ -253,10 +410,14 @@ Parent chain:
 Below are representative documents from one cluster:
 {sample_text}
 
+Cluster document count:
+{cluster_doc_count}
+
 Generate a JSON object defining the subtopic:
 - "name": 2–4 word noun phrase summarizing the shared meaning.
 - "description": 1–2 neutral sentences briefly defining the concept.
 - The name MUST be a strict subtopic of the parent chain.
+- The subtopic should be specific enough to distinguish this cluster from nearby sibling clusters.
 - NO vague terms like "issues", "changes", "misc", "various".
 - NO content outside the parent's conceptual scope.
 - NO examples, no specific dates, no unrelated domains.
@@ -278,7 +439,7 @@ Below are raw subtopic candidates:
 {raw_topics_json}
 
 Task:
-1. Group these candidates into 6–7 broader categories.
+1. Group these candidates into about {target_groups} broader categories.
 2. For each group, create:
    - "name": 2–3 word abstract noun phrase.
    - "description": 1–2 sentence definition.
@@ -288,6 +449,13 @@ Rules:
 - Keep a consistent abstraction level.
 - Avoid vague names (Misc, Other, Various).
 - Merge semantically similar topics.
+- Prefer reasonably balanced groups when possible.
+- Cover the raw topics as completely as possible.
+- Avoid duplicate or near-duplicate group names.
+- Each group should be semantically distinct from its siblings.
+- Keep domains coherent; do not mix unrelated technical themes in one group.
+- Use member_names exactly from the provided raw topic names.
+- It is acceptable to return fewer than {target_groups} groups if the candidates are tightly related, but do not collapse clearly distinct themes.
 - Result must be JSON list.
 """
 

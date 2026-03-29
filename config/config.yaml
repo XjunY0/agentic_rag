@@ -1,14 +1,15 @@
 defaults:
   - model: qwen
-  - dataset: 2wiki
+  - dataset: toy_dataset
   - search: default
   - _self_
 
 resources:
-  global_llm_concurrency: 24
+  global_llm_concurrency: 100
   global_gpu_concurrency: 1
 
 storage:
   path: ${hydra:runtime.cwd}/storage/${dataset.name}
+  force_rebuild_ontology: false
 
 output_dir: ${hydra:runtime.cwd}/outputs/${dataset.name}

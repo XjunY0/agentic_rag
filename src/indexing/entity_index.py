@@ -17,6 +17,9 @@ class SpacyExtractor:
             spacy.cli.download(model_name)
             self.nlp = spacy.load(model_name)
 
+        # Increase max_length to handle large documents
+        self.nlp.max_length = 10000000
+
         if "parser" not in self.nlp.pipe_names and "senter" not in self.nlp.pipe_names:
             self.nlp.add_pipe("sentencizer")
 

@@ -13,6 +13,7 @@ from ..utils.logger import setup_logger
 from ..models.base import BaseLLMClient, BaseEmbeddingModel
 from ..prompts.manager import PromptManager
 from ..utils.helpers import parse_llm_json
+from ..utils.visualize_ontology import generate_html
 
 logger = setup_logger(__name__)
 
@@ -96,6 +97,23 @@ class TreeNode:
             node.add_child(TreeNode.from_dict(child_data, node))
         return node
 
+
+def format_node_for_prompt(
+    node: TreeNode,
+    include_desc: bool = False,
+    node_similarity: Optional[float] = None,
+) -> str:
+    lines = [
+        f"node_id: {node.node_id}",
+        f"concept_path: {node.concept_path()}",
+        f"attached_doc_count: {len(node.doc_ids)}",
+    ]
+    if node_similarity is not None:
+        lines.append(f"node_similarity: {node_similarity:.4f}")
+    if include_desc and node.desc:
+        lines.append(f"semantic_definition: {node.desc}")
+    return "\n   ".join(lines)
+
 class FaissNodeIndex:
     def __init__(self, dim: int, M: int = 32):
         self.dim = dim
@@ -151,6 +169,15 @@ class VectorClassifier:
         if node_id not in self._node_locks:
             self._node_locks[node_id] = asyncio.Lock()
         return self._node_locks[node_id]
+
+    @staticmethod
+    def _is_ancestor(ancestor: TreeNode, descendant: TreeNode) -> bool:
+        cur = descendant.parent
+        while cur:
+            if cur is ancestor:
+                return True
+            cur = cur.parent
+        return False
 
     def collect_nodes(self) -> List[TreeNode]:
         nodes = []
@@ -219,15 +246,22 @@ class VectorClassifier:
         async with lock:
             self.index.add_nodes_with_vectors(new_nodes, vecs)
 
-    async def _llm_filter_nodes(self, doc_text: str, candidates: List[TreeNode]) -> List[str]:
+    async def _llm_filter_nodes(
+        self,
+        doc_text: str,
+        candidates: List[TreeNode],
+        top_k: Optional[int] = None,
+    ) -> List[str]:
+        include_desc = bool(self.config.get("include_desc_in_mount_prompt", True))
+        limit = int(top_k if top_k is not None else self.top_k_attach)
         nodes_text = "\n".join(
-            f"- node_id: {n.node_id}\n  concept_chain: {n.concept_path()}"
+            "- " + format_node_for_prompt(n, include_desc=include_desc)
             for n in candidates
         )
         prompt = PromptManager.get_prompt('PROMPT_FILTER_NODES').format(
             doc_text=doc_text[:2000], # Truncate for LLM
             nodes=nodes_text,
-            top_k=self.top_k_attach,
+            top_k=limit,
         )
         try:
             res_text = await self.llm.chat([{"role": "user", "content": prompt}], response_format={"type": "json_object"})
@@ -238,9 +272,46 @@ class VectorClassifier:
             if not isinstance(keep, list):
                 return []
             cand_ids = {n.node_id for n in candidates}
-            return [x for x in keep if x in cand_ids][:self.top_k_attach]
+            kept_ids = [x for x in keep if x in cand_ids][:limit]
+            if not self.config.get("prefer_deepest_mount_only", False):
+                return kept_ids
+
+            id_to_node = {n.node_id: n for n in candidates}
+            pruned = []
+            for nid in kept_ids:
+                node = id_to_node.get(nid)
+                if node is None:
+                    continue
+                shadowed = False
+                for other_id in kept_ids:
+                    if other_id == nid:
+                        continue
+                    other = id_to_node.get(other_id)
+                    if other is not None and self._is_ancestor(node, other):
+                        shadowed = True
+                        break
+                if not shadowed:
+                    pruned.append(nid)
+            return pruned[:limit]
         except Exception:
             return []
+
+    async def _wait_for_pending_splits(self):
+        pending = [t for t in self._split_tasks.values() if t and not t.done()]
+        if pending:
+            await asyncio.gather(*pending)
+
+    def collect_attached_doc_ids(self) -> Set[str]:
+        attached: Set[str] = set()
+
+        def dfs(node: TreeNode):
+            for doc_id in node.doc_ids:
+                attached.add(doc_id)
+            for child in node.children:
+                dfs(child)
+
+        dfs(self.root)
+        return attached
 
     async def attach_doc_to_node(self, node: TreeNode, doc_id: str, corpus_map: Dict[str, str]):
         lk = self._get_node_lock(node.node_id)
@@ -348,10 +419,156 @@ class VectorClassifier:
                 await fut
             except Exception as e:
                 logger.error(f"Error processing doc: {e}")
-        
-        pending = [t for t in self._split_tasks.values() if t and not t.done()]
-        if pending:
-            await asyncio.gather(*pending)
+
+        await self._wait_for_pending_splits()
+
+    async def ensure_full_mount(self, corpus: List[Dict[str, Any]], doc_vecs: np.ndarray) -> Dict[str, int]:
+        stats = {
+            "unmounted_before": 0,
+            "llm_attached": 0,
+            "vector_fallback_attached": 0,
+            "still_unmounted": 0,
+        }
+        if not self.config.get("ensure_full_mount", True):
+            return stats
+
+        mounted = self.collect_attached_doc_ids()
+        unmounted_indices = [
+            i for i, doc in enumerate(corpus)
+            if str(doc["id"]) not in mounted
+        ]
+        stats["unmounted_before"] = len(unmounted_indices)
+        if not unmounted_indices:
+            return stats
+
+        sem = asyncio.Semaphore(self.llm_max_concurrency)
+        corpus_map = {str(d["id"]): d["text"] for d in corpus}
+
+        async def handle_one(i: int) -> str:
+            doc = corpus[i]
+            doc_id = str(doc["id"])
+            vec = doc_vecs[i]
+            candidates = await self._faiss_search_one(vec)
+            if not candidates:
+                return "still_unmounted"
+
+            async with sem:
+                keep_ids = await self._llm_filter_nodes(doc["text"], candidates)
+            id_to_node = {n.node_id: n for n in candidates}
+            if keep_ids:
+                for nid in keep_ids:
+                    node = id_to_node.get(nid)
+                    if node is not None:
+                        await self.attach_doc_to_node(node, doc_id, corpus_map)
+                return "llm_attached"
+
+            if self.config.get("force_mount_fallback_to_best_candidate", True):
+                await self.attach_doc_to_node(candidates[0], doc_id, corpus_map)
+                return "vector_fallback_attached"
+
+            return "still_unmounted"
+
+        tasks = [handle_one(i) for i in unmounted_indices]
+        for fut in tqdm_asyncio.as_completed(tasks, desc="Repairing unmounted docs"):
+            try:
+                outcome = await fut
+                stats[outcome] = stats.get(outcome, 0) + 1
+            except Exception as e:
+                logger.error(f"Failed to repair unmounted doc: {e}")
+                stats["still_unmounted"] += 1
+
+        await self._wait_for_pending_splits()
+
+        mounted_after = self.collect_attached_doc_ids()
+        stats["still_unmounted"] = sum(
+            1 for doc in corpus if str(doc["id"]) not in mounted_after
+        )
+        return stats
+
+    async def push_docs_to_children(self, corpus: List[Dict[str, Any]], doc_vecs: np.ndarray) -> Dict[str, int]:
+        stats = {
+            "docs_considered": 0,
+            "docs_pushed": 0,
+            "parent_docs_retained": 0,
+        }
+        if not self.config.get("pushdown_after_mount", True):
+            return stats
+
+        corpus_map = {str(d["id"]): d["text"] for d in corpus}
+        doc_id_to_idx = {str(d["id"]): i for i, d in enumerate(corpus)}
+        sem = asyncio.Semaphore(self.llm_max_concurrency)
+        child_vec_cache: Dict[Tuple[str, ...], np.ndarray] = {}
+        candidate_children = int(self.config.get("pushdown_candidate_children", 3))
+        top_k_children = int(self.config.get("pushdown_top_k_children", 1))
+
+        async def get_child_vecs(children: List[TreeNode]) -> np.ndarray:
+            cache_key = tuple(child.node_id for child in children)
+            if cache_key in child_vec_cache:
+                return child_vec_cache[cache_key]
+
+            texts = [child.embedding_text() for child in children]
+            encode_fn = getattr(self.embedder, "encode_async", None)
+            if encode_fn is None:
+                vecs = await asyncio.to_thread(self.embedder.encode, texts)
+            else:
+                vecs = await encode_fn(texts)
+
+            vecs = np.ascontiguousarray(vecs)
+            faiss.normalize_L2(vecs)
+            child_vec_cache[cache_key] = vecs
+            return vecs
+
+        async def recurse(node: TreeNode):
+            children = [child for child in node.children if child is not None]
+            if children and node.doc_ids:
+                child_vecs = await get_child_vecs(children)
+                remaining_doc_ids = []
+
+                for doc_id in list(node.doc_ids):
+                    stats["docs_considered"] += 1
+                    doc_idx = doc_id_to_idx.get(doc_id)
+                    doc_text = corpus_map.get(doc_id, "")
+                    if doc_idx is None or not doc_text:
+                        remaining_doc_ids.append(doc_id)
+                        stats["parent_docs_retained"] += 1
+                        continue
+
+                    sims = child_vecs @ doc_vecs[doc_idx]
+                    shortlist_idx = np.argsort(-sims)[: min(len(children), candidate_children)]
+                    candidates = [children[i] for i in shortlist_idx]
+
+                    async with sem:
+                        keep_ids = await self._llm_filter_nodes(
+                            doc_text,
+                            candidates,
+                            top_k=top_k_children,
+                        )
+
+                    if keep_ids:
+                        id_to_node = {candidate.node_id: candidate for candidate in candidates}
+                        moved = False
+                        for nid in keep_ids[:top_k_children]:
+                            target = id_to_node.get(nid)
+                            if target is not None:
+                                await self.attach_doc_to_node(target, doc_id, corpus_map)
+                                moved = True
+                        if moved:
+                            stats["docs_pushed"] += 1
+                        else:
+                            remaining_doc_ids.append(doc_id)
+                            stats["parent_docs_retained"] += 1
+                    else:
+                        remaining_doc_ids.append(doc_id)
+                        stats["parent_docs_retained"] += 1
+
+                node.doc_ids = remaining_doc_ids
+
+            for child in children:
+                await recurse(child)
+
+        await recurse(self.root)
+        await self._wait_for_pending_splits()
+        return stats
 
 class OntologyIndex:
     def __init__(self, index_path: str, config: Dict[str, Any] = None):
@@ -360,11 +577,167 @@ class OntologyIndex:
         self.root = TreeNode("Root", 1)
         self.search_index = None
         self.search_node_ids = []
+        self.doc_ids: List[str] = []
+        self.doc_id_to_idx: Dict[str, int] = {}
+        self.doc_vecs: Optional[np.ndarray] = None
+        self.corpus_doc_ids: List[str] = []
+        self.build_stats: Dict[str, Any] = {}
+
+    def _cache_runtime_doc_data(self, corpus: List[Dict[str, Any]], doc_vecs: Optional[Any]):
+        self.doc_ids = [str(doc["id"]) for doc in corpus]
+        self.doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(self.doc_ids)}
+        if doc_vecs is None:
+            self.doc_vecs = None
+            return
+
+        vecs = np.ascontiguousarray(np.asarray(doc_vecs, dtype="float32"))
+        if vecs.ndim != 2 or vecs.shape[0] != len(self.doc_ids):
+            logger.warning(
+                "Skipping ontology runtime doc-vector cache due to shape mismatch: "
+                f"vecs={getattr(vecs, 'shape', None)} docs={len(self.doc_ids)}"
+            )
+            self.doc_vecs = None
+            return
+
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        if np.any((norms > 0) & (np.abs(norms - 1.0) > 1e-3)):
+            vecs = vecs / np.clip(norms, 1e-12, None)
+        self.doc_vecs = vecs
+
+    def _score_docs_for_node(
+        self,
+        query_vec: np.ndarray,
+        node: TreeNode,
+        node_relevance: float,
+        node_similarity: float,
+        max_docs_per_node: int,
+        doc_similarity_weight: float,
+        node_similarity_weight: float,
+    ) -> List[Dict[str, Any]]:
+        if not node.doc_ids:
+            return []
+
+        doc_sims: Dict[str, float] = {}
+        if self.doc_vecs is not None and self.doc_id_to_idx:
+            valid_pairs = [(did, self.doc_id_to_idx.get(did)) for did in node.doc_ids]
+            valid_pairs = [(did, idx) for did, idx in valid_pairs if idx is not None]
+            if valid_pairs:
+                indices = [idx for _, idx in valid_pairs]
+                sims = np.dot(self.doc_vecs[indices], query_vec[0])
+                doc_sims = {
+                    did: float(sim)
+                    for (did, _), sim in zip(valid_pairs, sims)
+                }
+
+        scored_docs = []
+        for did in node.doc_ids:
+            doc_sim = max(0.0, doc_sims.get(did, 0.0))
+            score = (
+                float(node_relevance)
+                + doc_similarity_weight * doc_sim
+                + node_similarity_weight * max(0.0, float(node_similarity))
+            )
+            scored_docs.append({
+                "id": did,
+                "score": float(score),
+                "node_id": node.node_id,
+                "concept_path": node.concept_path(),
+                "node_relevance": float(node_relevance),
+                "node_similarity": float(node_similarity),
+                "doc_similarity": float(doc_sim),
+            })
+
+        scored_docs.sort(key=lambda x: x["score"], reverse=True)
+        return scored_docs[:max_docs_per_node]
+
+    def build_report(self) -> Dict[str, Any]:
+        nodes = self.get_all_nodes()
+        leaves = [n for n in nodes if not n.children]
+        internal_nodes = [n for n in nodes if n.children]
+        level_counts: Dict[int, int] = {}
+        docs_to_nodes: Dict[str, List[TreeNode]] = {}
+        sibling_name_duplicates = []
+
+        for node in nodes:
+            level_counts[node.level] = level_counts.get(node.level, 0) + 1
+            for did in node.doc_ids:
+                docs_to_nodes.setdefault(did, []).append(node)
+            if node.children:
+                seen_names: Dict[str, int] = {}
+                for child in node.children:
+                    norm = normalize_name(child.name)
+                    seen_names[norm] = seen_names.get(norm, 0) + 1
+                dup_names = [name for name, count in seen_names.items() if name and count > 1]
+                if dup_names:
+                    sibling_name_duplicates.append({
+                        "concept_path": node.concept_path(),
+                        "duplicate_names": dup_names,
+                    })
+
+        def _stats(counts: List[int]) -> Dict[str, float]:
+            if not counts:
+                return {"min": 0, "mean": 0.0, "median": 0.0, "max": 0}
+            arr = np.asarray(counts)
+            return {
+                "min": int(arr.min()),
+                "mean": float(arr.mean()),
+                "median": float(np.median(arr)),
+                "max": int(arr.max()),
+            }
+
+        top_n = int(
+            self.config.get(
+                "build_report_top_n",
+                self.config.get("audit_top_large_nodes", 20),
+            )
+        )
+        overloaded_nodes = sorted(
+            [
+                {
+                    "level": node.level,
+                    "name": node.name,
+                    "concept_path": node.concept_path(),
+                    "doc_count": len(node.doc_ids),
+                    "child_count": len(node.children),
+                    "has_desc": bool(node.desc),
+                }
+                for node in nodes
+            ],
+            key=lambda x: (-x["doc_count"], x["level"], x["concept_path"]),
+        )[:top_n]
+
+        corpus_doc_ids = set(self.corpus_doc_ids)
+        mounted_doc_ids = set(docs_to_nodes.keys())
+        unmounted_doc_ids = sorted(corpus_doc_ids - mounted_doc_ids) if corpus_doc_ids else []
+
+        return {
+            "corpus_doc_count": len(corpus_doc_ids),
+            "mounted_doc_count": len(mounted_doc_ids),
+            "unmounted_doc_count": len(unmounted_doc_ids),
+            "unmounted_doc_ids_preview": unmounted_doc_ids[:50],
+            "total_nodes": len(nodes),
+            "leaf_nodes": len(leaves),
+            "internal_nodes": len(internal_nodes),
+            "max_depth": max((node.level for node in nodes), default=0),
+            "level_counts": level_counts,
+            "leaf_doc_stats": _stats([len(node.doc_ids) for node in leaves]),
+            "internal_doc_stats": _stats([len(node.doc_ids) for node in internal_nodes]),
+            "nodes_without_desc": sum(1 for node in nodes if not (node.desc or "").strip()),
+            "internal_nodes_with_docs": sum(1 for node in internal_nodes if node.doc_ids),
+            "docs_attached_to_multiple_nodes": sum(1 for attached in docs_to_nodes.values() if len(attached) > 1),
+            "max_doc_membership": max((len(attached) for attached in docs_to_nodes.values()), default=0),
+            "sibling_name_duplicates": sibling_name_duplicates[:top_n],
+            "overloaded_nodes": overloaded_nodes,
+            "build_stats": self.build_stats,
+        }
 
     async def build(self, corpus: List[Dict[str, Any]], llm: BaseLLMClient, embedder: BaseEmbeddingModel, doc_vecs: Optional[Any] = None, force: bool = False):
+        self.corpus_doc_ids = [str(doc["id"]) for doc in corpus]
+        self.build_stats = {}
         if os.path.exists(self.index_path) and not force:
             logger.info(f"Ontology index already exists at {self.index_path}. Skipping build.")
             self.load()
+            self._cache_runtime_doc_data(corpus, doc_vecs)
             return
 
         logger.info(f"Building Ontology index at {self.index_path}...")
@@ -402,7 +775,8 @@ class OntologyIndex:
                 min_cluster_k=self.config.get("min_cluster_k", 10),
                 max_cluster_k=self.config.get("max_cluster_k", 60),
                 min_docs_to_split=self.config.get("min_docs_to_split", 100),
-                concurrency=self.config.get("concurrency", 16)
+                concurrency=self.config.get("concurrency", 16),
+                sample_docs_for_split=self.config.get("sample_docs_for_split", 10),
             )
             
             self.root = await builder.build(texts, ids, doc_vecs)
@@ -434,6 +808,9 @@ class OntologyIndex:
 
         # 3. Streaming assign with split-on-the-fly
         await classifier.process_docs_streaming(corpus, doc_vecs)
+        self.build_stats = {
+            "mount_mode": "vector_classifier",
+        }
 
         # 4. Clean tree
         self.clean_tree()
@@ -459,6 +836,8 @@ class OntologyIndex:
             faiss.normalize_L2(vecs)
             self.search_index = faiss.IndexFlatIP(vecs.shape[1])
             self.search_index.add(vecs)
+
+        self._cache_runtime_doc_data(corpus, doc_vecs)
         
         self.save()
         if classifier.index:
@@ -476,6 +855,27 @@ class OntologyIndex:
             
             if self.search_index:
                 faiss.write_index(self.search_index, self.index_path + ".search.faiss")
+                
+        # Generate visualization
+        html_path = os.path.splitext(self.index_path)[0] + ".html"
+        try:
+            generate_html(self.index_path, html_path)
+            logger.info(f"Ontology visualization saved to {html_path}")
+        except Exception as e:
+            logger.error(f"Failed to generate ontology visualization: {e}")
+
+        if self.config.get("build_report_enabled") or self.config.get("audit_enabled"):
+            report_path = os.path.splitext(self.index_path)[0] + ".report.json"
+            audit_path = os.path.splitext(self.index_path)[0] + ".audit.json"
+            try:
+                report = self.build_report()
+                with open(report_path, "w", encoding="utf-8") as f:
+                    json.dump(report, f, ensure_ascii=False, indent=2)
+                with open(audit_path, "w", encoding="utf-8") as f:
+                    json.dump(report, f, ensure_ascii=False, indent=2)
+                logger.info(f"Ontology build report saved to {report_path}")
+            except Exception as e:
+                logger.error(f"Failed to save ontology build report: {e}")
 
     def load(self):
         with open(self.index_path, "r", encoding="utf-8") as f:
@@ -508,10 +908,10 @@ class OntologyIndex:
         dfs(self.root)
         return nodes
 
-    async def search(self, query: str, embedder: BaseEmbeddingModel, llm: BaseLLMClient, top_k_nodes: int = 20) -> List[Dict[str, Any]]:
+    async def search(self, query: str, embedder: BaseEmbeddingModel, llm: BaseLLMClient, top_k_nodes: int = 20) -> Dict[str, Any]:
         """Search for relevant documents via ontology nodes."""
         if not self.search_index or not self.search_node_ids:
-            return []
+            return {"results": [], "trace": None}
         
         encode_fn = getattr(embedder, "encode_async", None)
         if encode_fn is None:
@@ -524,16 +924,25 @@ class OntologyIndex:
         scores, indices = self.search_index.search(query_vec, min(top_k_nodes, len(self.search_node_ids)))
         
         all_nodes = {n.node_id: n for n in self.get_all_nodes()}
-        candidates = []
-        for idx in indices[0]:
+        candidate_entries = []
+        for rank, (node_score, idx) in enumerate(zip(scores[0], indices[0]), start=1):
             if idx != -1 and idx < len(self.search_node_ids):
                 nid = self.search_node_ids[idx]
                 if nid in all_nodes:
-                    candidates.append(all_nodes[nid])
+                    candidate_entries.append({
+                        "rank": rank,
+                        "node": all_nodes[nid],
+                        "node_similarity": float(node_score),
+                    })
         
-        if not candidates: return []
+        if not candidate_entries:
+            return {"results": [], "trace": None}
         
-        concept_lines = [f"{i+1}. node_id: {n.node_id}\n   concept_path: {n.concept_path()}" for i, n in enumerate(candidates)]
+        include_desc = bool(self.config.get("include_desc_in_search_prompt", True))
+        concept_lines = [
+            f"{entry['rank']}. {format_node_for_prompt(entry['node'], include_desc=include_desc, node_similarity=entry['node_similarity'])}"
+            for entry in candidate_entries
+        ]
         concepts_text = "\n".join(concept_lines)
         
         prompt = PromptManager.get_prompt('ONTOLOGY_RELEVANCE_USER').format(query=query, concepts_text=concepts_text)
@@ -545,19 +954,86 @@ class OntologyIndex:
             res_text = await llm.chat(messages, response_format={"type": "json_object"})
             relevance_map = parse_llm_json(res_text)
             if not relevance_map:
-                return []
+                return {"results": [], "trace": None}
 
             relevance2score = {"strong": 2, "weak": 1, "none": 0}
-            doc_scores = {}
+            max_docs_per_node = int(self.config.get("search_max_docs_per_node", 8))
+            doc_similarity_weight = float(self.config.get("search_doc_similarity_weight", 1.0))
+            node_similarity_weight = float(self.config.get("search_node_similarity_weight", 0.15))
 
-            node_map = {n.node_id: n for n in candidates}
+            doc_scores: Dict[str, Dict[str, Any]] = {}
+            node_map = {entry["node"].node_id: entry for entry in candidate_entries}
+            selected_nodes = []
             for nid, rel in relevance_map.items():
                 score = relevance2score.get(rel.lower().strip(), 0)
                 if score > 0 and nid in node_map:
-                    for did in node_map[nid].doc_ids:
-                        doc_scores[did] = max(doc_scores.get(did, 0), score)
+                    entry = node_map[nid]
+                    node = entry["node"]
+                    selected_nodes.append({
+                        "node_id": node.node_id,
+                        "concept_path": node.concept_path(),
+                        "node_similarity": float(entry["node_similarity"]),
+                        "llm_relevance": rel.lower().strip(),
+                        "doc_count": len(node.doc_ids),
+                    })
+                    for doc_res in self._score_docs_for_node(
+                        query_vec=query_vec,
+                        node=node,
+                        node_relevance=float(score),
+                        node_similarity=float(entry["node_similarity"]),
+                        max_docs_per_node=max_docs_per_node,
+                        doc_similarity_weight=doc_similarity_weight,
+                        node_similarity_weight=node_similarity_weight,
+                    ):
+                        did = doc_res["id"]
+                        prev = doc_scores.get(did)
+                        if prev is None or doc_res["score"] > prev["score"]:
+                            doc_scores[did] = doc_res
 
-            return [{"id": did, "score": float(score)} for did, score in doc_scores.items()]
+            ranked_docs = sorted(doc_scores.values(), key=lambda x: x["score"], reverse=True)
+            results = [
+                {
+                    "id": item["id"],
+                    "score": float(item["score"]),
+                    "node_id": item["node_id"],
+                    "concept_path": item["concept_path"],
+                    "node_relevance": item["node_relevance"],
+                    "node_similarity": item["node_similarity"],
+                    "doc_similarity": item["doc_similarity"],
+                }
+                for item in ranked_docs
+            ]
+
+            trace = None
+            if self.config.get("search_trace_enabled", True):
+                trace = {
+                    "query_preview": query[:200],
+                    "top_k_nodes": int(top_k_nodes),
+                    "candidate_nodes": [
+                        {
+                            "rank": entry["rank"],
+                            "node_id": entry["node"].node_id,
+                            "concept_path": entry["node"].concept_path(),
+                            "desc": entry["node"].desc,
+                            "doc_count": len(entry["node"].doc_ids),
+                            "node_similarity": float(entry["node_similarity"]),
+                            "llm_relevance": relevance_map.get(entry["node"].node_id, "none"),
+                        }
+                        for entry in candidate_entries
+                    ],
+                    "selected_nodes": selected_nodes,
+                    "returned_docs": [
+                        {
+                            "id": item["id"],
+                            "score": float(item["score"]),
+                            "node_id": item["node_id"],
+                            "doc_similarity": float(item["doc_similarity"]),
+                        }
+                        for item in ranked_docs[: min(len(ranked_docs), 20)]
+                    ],
+                }
+
+            return {"results": results, "trace": trace}
         except Exception as e:
             logger.error(f"Ontology search failed: {e}")
-            return []
+            return {"results": [], "trace": None}
