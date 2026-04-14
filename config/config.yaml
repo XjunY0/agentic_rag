@@ -1,12 +1,21 @@
 defaults:
   - model: qwen
-  - dataset: toy_dataset
+  - dataset: full
   - search: default
   - _self_
 
 resources:
-  global_llm_concurrency: 100
+  global_llm_concurrency: 500
   global_gpu_concurrency: 1
+
+
+search:
+  query_concurrency: 16
+  subquery_concurrency: 4
+  llm_concurrency: 100
+
+evaluation:
+  llm_judge_concurrency: 32
 
 storage:
   path: ${hydra:runtime.cwd}/storage/${dataset.name}

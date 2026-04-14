@@ -4,10 +4,10 @@ rrf_k: 60
 llm_concurrency: 100
 concept_bonus: 0.0025
 weights:
-  bm25: 0.5
-  vector: 0.8
-  entity: 0.2
-  ontology: 1.0
+  bm25: 0.25
+  vector: 1
+  entity: 0.1
+  ontology: 0
 faiss:
   hnsw_m: 32
   ef_construction: 200
@@ -18,7 +18,6 @@ ontology:
   split_threshold: 60
   max_depth: 4
   max_k_children: 3
-  sample_docs_for_split: 10
   min_level_for_mount: 2
   top_k_recall: 20
   top_k_mount: 2
@@ -34,4 +33,4 @@ ontology:
   min_cluster_k: 10
   max_cluster_k: 60
   min_docs_to_split: 100
-ontology_enabled: true
+ontology_enabled: false

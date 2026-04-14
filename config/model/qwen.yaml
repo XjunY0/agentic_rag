@@ -1,5 +1,5 @@
-llm_name: qwen-plus
+llm_name: qwen3.5-flash
 embedding_name: qwen/qwen3-embedding-0.6B
-embedding_dim: 256
-api_key: ${oc.env:QWEN_API_KEY}
+embedding_dim: 1024
 base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+api_key: ${oc.env:QWEN_API_KEY,""}

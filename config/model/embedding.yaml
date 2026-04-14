@@ -1,0 +1,2 @@
+embedding_name: qwen/qwen3-embedding-0.6B
+embedding_dim: 256

@@ -30,6 +30,24 @@ def write_jsonl(path: str, items: List[Dict[str, Any]]) -> None:
             else:
                 f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
+
+def append_jsonl(path: str, item: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        if isinstance(item, dict) and "id" in item:
+            ordered = {"id": item["id"]}
+            for k, v in item.items():
+                if k == "id":
+                    continue
+                ordered[k] = v
+            payload = ordered
+        else:
+            payload = item
+
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
 def load_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)

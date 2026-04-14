@@ -5,72 +5,112 @@ class PromptManager:
     
     # --- Query Planner Prompts ---
     QUERY_PLANNER_SYSTEM = (
-        "You are a Query Planning Module for retrieval-augmented search systems.\n\n"
+        "You are a high-level Query Planning Module for an agentic QA system.\n\n"
 
         "SCOPE (NON-NEGOTIABLE):\n"
-        "- Your task is LIMITED to query rewriting and retrieval planning.\n"
+        "- Your task is LIMITED to understanding the user's question and planning information-gathering steps.\n"
         "- Do NOT answer the user's question.\n"
-        "- Do NOT generate facts, explanations, or conclusions.\n"
-        "- Do NOT invent missing entities, dates, versions, release tags, source-code details, or webpage state.\n"
-        "- If the query contains unknown or ambiguous details, preserve uncertainty instead of guessing.\n\n"
+        "- Do NOT generate facts, conclusions, explanations, or likely answers.\n"
+        "- Do NOT invent missing entities, dates, versions, relationships, source-code details, issue status, or webpage state.\n"
+        "- If a detail is unknown or ambiguous, preserve that uncertainty and plan how to retrieve or verify it.\n\n"
 
         "MISSION:\n"
-        "Your goal is to maximize recall of relevant documents for the user's topic.\n"
-        "Prefer broad but still on-topic retrieval coverage over prematurely narrowing to one exact answer path.\n\n"
+        "Your goal is to analyze the question at a macro level and decompose it into a small number of useful, "
+        "well-scoped sub-queries. Each sub-query should correspond to a real information need required to answer "
+        "the original question, not merely a keyword variation.\n\n"
 
         "You MUST reason step-by-step internally, but only output the final JSON object that follows the schema exactly.\n\n"
 
         "--------------------------------\n"
         "INTERNAL PLANNING PIPELINE (DO NOT OUTPUT):\n"
-        "1. Identify the user's core topic, symptom, and likely information need.\n"
-        "2. Identify the most retrieval-useful anchors already present in the query, such as:\n"
-        "   - error messages or symptoms\n"
-        "   - model / package / class / API / parser names\n"
-        "   - version names, flags, configuration terms\n"
-        "   - issue / PR / commit identifiers when explicitly present\n"
-        "3. Build a MACRO RETRIEVAL STRATEGY that maximizes coverage of the relevant document space.\n"
-        "   Cover complementary angles such as symptom wording, component names, compatibility terms,\n"
-        "   configuration terms, and likely root-cause areas.\n"
-        "4. Rewrite the query into ONE normalized retrieval query that preserves the main topic while staying broad enough\n"
-        "   to retrieve diverse but relevant documents.\n"
-        "5. Decide whether decomposition helps recall.\n"
-        "   Decomposition is helpful when different query angles may retrieve different relevant documents.\n"
-        "6. If decomposing, create 2-3 complementary sub-queries that explore different relevant aspects.\n"
-        "   Good diversity dimensions include:\n"
-        "   - symptom / error wording\n"
-        "   - module / class / parser / API names\n"
-        "   - version / compatibility / configuration wording\n"
-        "   - fix / issue / implementation wording\n"
-        "7. Avoid over-narrowing too early.\n"
-        "   Unless explicitly present in the user's query, do NOT jump directly to:\n"
-        "   - latest PR status or recent comments\n"
-        "   - exact release tags\n"
-        "   - exact source-code lines or regexes\n"
-        "   - highly specific webpage state\n"
-        "   if doing so would reduce recall.\n"
-        "8. Verify internally:\n"
-        "   - Every sub-query must stay within the same topic.\n"
-        "   - Sub-queries should be complementary, not redundant copies.\n"
-        "   - The rewritten_query should remain a broad semantic umbrella over the sub-queries.\n"
-        "   - Prefer recall-oriented queries over answer-oriented queries.\n\n"
+        "1. Identify the user's final answer target:\n"
+        "   - What exact thing is the user asking for?\n"
+        "   - Is the answer expected to be a person, date, location, explanation, fix, comparison, cause, or status?\n"
+        "2. Identify the known anchors already present in the query:\n"
+        "   - named entities, titles, products, packages, APIs, classes, files, error messages, versions, flags, IDs, or constraints.\n"
+        "   - Preserve exact anchors when they are useful; do not paraphrase precise strings such as error messages, version numbers, flags, or issue IDs.\n"
+        "3. Identify missing intermediate facts or dependencies:\n"
+        "   - For multi-hop questions, determine which bridge facts must be found first.\n"
+        "   - For debugging or software questions, determine whether the missing pieces are symptom, component, cause, fix, compatibility, or configuration.\n"
+        "   - For comparison questions, determine the attributes that must be gathered for each side.\n"
+        "4. Decide whether decomposition is necessary:\n"
+        "   - Do NOT decompose if the question can be answered by retrieving one focused fact or one coherent document.\n"
+        "   - Decompose when the question has multiple dependent facts, multiple entities, comparison logic, or a cause/fix chain.\n"
+        "5. Create a macro plan:\n"
+        "   - The plan should describe the information path needed to answer the original question.\n"
+        "   - The plan should be concise and should not include any factual claims not present in the user query.\n"
+        "6. Create sub-queries:\n"
+        "   - Each sub-query must target one missing information need.\n"
+        "   - Sub-queries should be ordered logically when dependencies exist.\n"
+        "   - Sub-queries should remain grounded in the original question and known anchors.\n"
+        "   - Avoid generating mere keyword variants of the same query.\n"
+        "7. Verify internally:\n"
+        "   - The sub-queries collectively support answering the original query.\n"
+        "   - No sub-query asks for information that is already explicitly provided by the user unless it must be verified.\n"
+        "   - No sub-query assumes an answer that has not yet been established.\n"
+        "   - The rewritten_query is a concise, normalized version of the original question, not an answer.\n\n"
 
         "--------------------------------\n"
         "OUTPUT RULES (STRICT):\n"
         "- Output ONLY a single valid JSON object.\n"
-        "- Do NOT include explanations, reasoning, or markdown outside the JSON.\n"
+        "- Do NOT include explanations, reasoning, markdown, or comments outside the JSON.\n"
         "- If decomposition is NOT necessary, output exactly ONE sub_query, which MUST be identical to rewritten_query.\n"
-        "- Output at most 3 sub_queries.\n\n"
+        "- Output at most 3 sub_queries.\n"
+        "- Preserve exact technical strings, names, IDs, versions, flags, and error messages when they are important.\n\n"
 
         "--------------------------------\n"
         "OUTPUT SCHEMA:\n"
         "{{\n"
         '  "role": "string",\n'
         '  "intent": "string",\n'
-        '  "macro_strategy": "string",\n'
         '  "rewritten_query": "string",\n'
         '  "sub_queries": ["string"]\n'
+        "}}"
+
+        "--------------------------------\n"
+        "EXAMPLES:\n\n"
+
+        "Example 1: Multi-hop QA\n"
+        "User query:\n"
+        "When did the father of Hermann II die?\n"
+        "Output:\n"
+        "{{\n"
+        '  "role": "planner",\n'
+        '  "intent": "Find the death date of the person who is Hermann II\'s father.",\n'
+        '  "rewritten_query": "When did the father of Hermann II die?",\n'
+        '  "sub_queries": [\n'
+        '    "Who was the father of Hermann II?",\n'
+        '    "When did Hermann II\'s father die?"\n'
+        "  ]\n"
+        "}}\n\n"
+
+        "Example 2: Direct QA\n"
+        "User query:\n"
+        "What is the date of birth of Christopher Nolan?\n"
+        "Output:\n"
+        "{{\n"
+        '  "role": "planner",\n'
+        '  "intent": "Find Christopher Nolan\'s date of birth.",\n'
+        '  "rewritten_query": "What is Christopher Nolan\'s date of birth?",\n'
+        '  "sub_queries": ["What is Christopher Nolan\'s date of birth?"]\n'
+        "}}\n\n"
+
+        "Example 3: Software debugging QA\n"
+        "User query:\n"
+        "Why does Eagle3 speculative decoding fail with a KeyError when using a quantized verifier model with an unquantized drafter model?\n"
+        "Output:\n"
+        "{{\n"
+        '  "role": "planner",\n'
+        '  "intent": "Explain the cause of the Eagle3 KeyError under mismatched verifier and drafter quantization settings.",\n'
+        '  "rewritten_query": "Why does Eagle3 speculative decoding fail with a KeyError when using a quantized verifier model with an unquantized drafter model?",\n'
+        '  "sub_queries": [\n'
+        '    "What KeyError occurs in Eagle3 speculative decoding with a quantized verifier and unquantized drafter?",\n'
+        '    "How does Eagle3 choose quantization configuration for verifier and drafter models?",\n'
+        '    "What causes or fixes the quantization mismatch in Eagle3 speculative decoding?"\n'
+        "  ]\n"
         "}}\n"
     )
+
 
     # QUERY_PLANNER_SYSTEM = (
     #     "You are a Query Planning Module for information retrieval and agentic systems.\n\n"
@@ -146,7 +186,7 @@ class PromptManager:
         "   Do not use external knowledge and do not connect Doc A to Doc B inside one fact.\n"
         "3. RECALL-SUPPORTIVE BEHAVIOR: A document does NOT need to fully answer the sub_query in order to be kept.\n"
         "   If it is strongly relevant to resolving the broader issue, keep it.\n"
-        "4. CONCISION: Each fact must be atomic (max 18 words).\n\n"
+        "4. CONCISION: Each fact must be atomic (max 30 words).\n\n"
         "OUTPUT JSON STRUCTURE as EXAMPLES:\n"
         "EXAMPLE 1 (TRUE CASE):\n"
         "User Query: 'What is the date of birth of Christopher Nolan?'\n"
@@ -207,7 +247,7 @@ class PromptManager:
         "For example, if Fact A says 'X is the father of Y' and Fact B says 'X died in 1172', you MUST combine them to conclude 'the father of Y died in 1172'.\n"
         "1. INCREMENTAL PROGRESS: If a sub-query has identified a specific entity, component, version, parser, API, issue, PR, commit, or configuration term, you MUST acknowledge it as GATHERED.\n"
         "2. EVIDENCE ONLY: Base your judgement strictly on the provided facts. Do not use internal knowledge.\n"
-        "3. GLOBAL EVIDENCE FIRST: Before judging, review ALL facts in 'accumulated_evidences'. These are confirmed facts from prior turns. "
+        "3. GLOBAL EVIDENCE FIRST: Before judging, review ALL facts in 'accumulated_evidences'. These are confirmed facts. "
         "If chaining accumulated facts with current facts already answers the original_query, set answered=true immediately.\n"
         "4. COVERAGE-FIRST REFLECTION: If answered=false, do NOT automatically narrow the search toward one exact missing fact.\n"
         "   First determine whether the current evidence shows a COVERAGE GAP instead, such as:\n"
@@ -218,9 +258,7 @@ class PromptManager:
         "5. RECALL-ORIENTED NEW_QUERY: If another turn is justified, the 'new_query' should expand or diversify retrieval within the same topic.\n"
         "   It should explore a missing angle, alternative terminology, or another relevant component.\n"
         "   Do NOT over-narrow to exact PR status, latest comments, exact release tags, or exact source-code lines unless such precision is already strongly supported by gathered facts.\n"
-        "6. STOPPING RULE: If the current turn adds no meaningful new evidence, or the missing information appears absent from the available corpus, do NOT keep forcing narrower searches.\n"
-        "   In that case, return answered=false with final_answer='INCOMPLETE', describe the coverage gap, and set new_query to an empty string.\n"
-        "7. You should organize the logic chain of evidence chains from the sub-queries to support your analysis.\n\n"
+        "6. You should organize the logic chain of evidence chains from the sub-queries to support your analysis.\n\n"
         "Output JSON format as EXAMPLES:\n"
         "EXAMPLE 1 (PARTIAL SUCCESS - BRIDGE BUILDING):\n"
         "Input:\n"
@@ -307,6 +345,22 @@ class PromptManager:
         "}}"
     )
 
+    REFLECTOR_FINAL_SYSTEM = (
+        "You are a final answer synthesizer for a retrieval-based QA system.\n\n"
+        "MISSION:\n"
+        "The search process has already reached its maximum number of turns. You MUST produce a final answer to the original_query using ONLY the provided evidence.\n\n"
+        "STRICT RULES:\n"
+        "1. EVIDENCE ONLY: Use only facts explicitly present in accumulated_evidences and sub_queries_status.\n"
+        "2. ANSWER THE ORIGINAL QUERY: final_answer must answer original_query, not the intermediate sub-queries.\n"
+        "OUTPUT JSON FORMAT:\n"
+        "{{\n"
+        '  "final_answer": "string",\n'
+        '  "thought": "string"\n'
+        "}}"
+    )
+
+
+
     # --- Ontology / Concept Tree Prompts ---
     ONTOLOGY_RELEVANCE_SYSTEM = (
         "You are a strict JSON generator. You MUST output ONLY valid JSON. No markdown."
@@ -353,6 +407,8 @@ RULES (STRICT):
    Do NOT match by surface keywords.
    If a semantic_definition is provided, use it to disambiguate broad concept names.
    If both a broad parent and its more specific child match, prefer the more specific child.
+   If two nodes represent distinct core facets of the document, keeping both is allowed.
+   Do NOT keep a node for incidental setup details, neighboring tools, or background context unless that is a main topic of the document.
 
 3) Do NOT force matches. If none are suitable, output an empty list.
 
@@ -388,12 +444,15 @@ RULES (STRICT):
 }}
 
 2) Create 2 or 3 children (no more). Prefer 2 unless 3 is clearly needed.
-3) New children must be same granularity level and non-overlapping in meaning.
-4) New children should manage different content from existing children (avoid duplicates).
-5) You must assign doc_ids only from the provided list. Do NOT invent ids.
-6) It is allowed to keep some documents at the parent in remain_doc_ids.
-7) Prefer balanced children. Avoid creating a child for just one or two outlier documents unless it is clearly justified.
-8) If a document is ambiguous, leave it in remain_doc_ids rather than forcing it into a bad child.
+3) Each child must be a strict semantic subtype of the CURRENT NODE CONCEPT CHAIN, not merely a related tool, dependency, environment, platform, example, or adjacent workflow.
+4) New children must be same granularity level and non-overlapping in meaning.
+5) Prefer core subject-matter distinctions, not page type distinctions such as error page, API reference, tutorial, release notes, or generic setup context.
+6) New children should manage different content from existing children (avoid duplicates).
+7) You must assign doc_ids only from the provided list. Do NOT invent ids.
+8) It is allowed to keep some documents at the parent in remain_doc_ids.
+9) Prefer balanced children. Avoid creating a child for just one or two outlier documents unless it is clearly justified.
+10) If a document is ambiguous, cross-cutting, or only loosely related, leave it in remain_doc_ids rather than forcing it into a bad child.
+11) If the provided documents are too mixed to form clean strict subtypes, return fewer children and keep more documents in remain_doc_ids.
 
 STRICT JSON OUTPUT ONLY.
 """
@@ -418,9 +477,13 @@ Generate a JSON object defining the subtopic:
 - "description": 1–2 neutral sentences briefly defining the concept.
 - The name MUST be a strict subtopic of the parent chain.
 - The subtopic should be specific enough to distinguish this cluster from nearby sibling clusters.
+- The subtopic must describe the core shared subject, not an incidental dependency, runtime environment, surrounding product, or neighboring workflow.
+- Prefer stable semantic concepts over page-format labels or support-context labels.
 - NO vague terms like "issues", "changes", "misc", "various".
+- NO labels that are primarily about document genre such as "API reference", "error page", "release notes", or "installation" unless that genre is itself the core subject within the parent.
 - NO content outside the parent's conceptual scope.
 - NO examples, no specific dates, no unrelated domains.
+- If the cluster looks mixed, choose the dominant in-scope concept and keep it conservative rather than inventing a broad or cross-domain label.
 
 Output format (must be JSON):
 {{
@@ -489,7 +552,7 @@ Return ONLY the description.
         base = getattr(cls, name, "")
         # Prompts that must strictly return JSON only
         json_strict = {
-            'QUERY_PLANNER_SYSTEM', 'VERIFIER_SYSTEM', 'REFLECTOR_SYSTEM',
+            'QUERY_PLANNER_SYSTEM', 'VERIFIER_SYSTEM', 'REFLECTOR_SYSTEM', 'REFLECTOR_FINAL_SYSTEM',
             'ONTOLOGY_RELEVANCE_SYSTEM', 'ONTOLOGY_RELEVANCE_USER',
             'PROMPT_FILTER_NODES', 'PROMPT_SPLIT_NODE', 'TREE_GEN_TOPIC',
             'TREE_MERGE_CATEGORIES'

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from typing import List, Dict, Any, Optional
 from tqdm.asyncio import tqdm_asyncio
@@ -43,6 +44,7 @@ class OmniSearch:
             api_key=config['model']['api_key'],
             base_url=config['model']['base_url'],
             model=config['model']['llm_name'],
+            api_mode=config['model'].get('api_mode', 'auto'),
             max_concurrency=llm_conc
         )
         self.embedding_model = QwenEmbeddingModel(
@@ -107,6 +109,10 @@ class OmniSearch:
             else:
                 doc_vecs = await encode_fn(texts)
 
+        if not self.ontology_enabled:
+            logger.info("Ontology search is disabled; skipping ontology index build.")
+            return
+
         force_rebuild_ontology = bool(self.config.get('storage', {}).get('force_rebuild_ontology', False))
         await self.ontology_index.build(
             corpus,
@@ -123,8 +129,8 @@ class OmniSearch:
         all_evidences = []
         all_doc_ids = set()
         trace_queries: List[str] = []
-        ontology_traces: List[Dict[str, Any]] = []
-        
+        turn_trace_details: List[Dict[str, Any]] = []
+
         while turn < self.max_turns:
             logger.info(f"Turn {turn + 1}: Planning for query: {current_query}")
             plan = await self.planner.plan(current_query)
@@ -152,23 +158,25 @@ class OmniSearch:
 
                 verification = await self.verifier.verify(sub_q, docs_for_verify)
                 verification["sub_query"] = sub_q
-                if multi_results.get("ontology_trace"):
-                    verification["ontology_trace"] = multi_results["ontology_trace"]
                 return verification
 
             tasks = [_process_subq(sq) for sq in sub_queries]
             turn_results = await asyncio.gather(*tasks)
+            turn_trace_details.append({
+                "turn": turn + 1,
+                "main_query": current_query,
+                "sub_queries": [
+                    {
+                        "sub_query": verification.get("sub_query", ""),
+                        "verifier_result": verification,
+                    }
+                    for verification in turn_results
+                ],
+            })
 
             for verification in turn_results:
                 all_evidences.extend(verification.get("evidences_chain", []))
                 all_doc_ids.update(verification.get("keep_ids", []))
-                ontology_trace = verification.get("ontology_trace")
-                if ontology_trace:
-                    ontology_traces.append({
-                        "turn": turn + 1,
-                        "sub_query": verification.get("sub_query"),
-                        "trace": ontology_trace,
-                    })
             
             # Reflect on the current turn's results using the query that was planned/executed this turn
             # Provide original query, current (rewritten) query, verifier results and accumulated evidences
@@ -178,13 +186,7 @@ class OmniSearch:
                 logger.info("Query fully answered.")
                 # persist trace for answered requests as well
                 try:
-                    import json
-                    os.makedirs(self.storage_dir, exist_ok=True)
-                    trace_path = os.path.join(self.storage_dir, "query_traces.jsonl")
-                    with open(trace_path, "a", encoding="utf-8") as tf:
-                        rid = str(request_id) if request_id is not None else "unknown"
-                        ordered = {"id": rid, "queries": trace_queries}
-                        tf.write(json.dumps(ordered, ensure_ascii=False) + "\n")
+                    self._persist_query_traces(request_id, trace_queries, turn_trace_details)
                 except Exception:
                     logger.warning("Failed to write query trace for answered request")
 
@@ -195,31 +197,55 @@ class OmniSearch:
                     "thought": reflection.get("thought"),
                     "doc_ids": list(all_doc_ids),
                     "turns": turn + 1,
-                    "ontology_traces": ontology_traces,
                 }
             # Update current_query to the new query suggested by reflector (defaults to previous current_query)
             current_query = reflection.get("new_query", current_query)
             turn += 1
 
-        final_ans = (last_reflection.get("final_answer") if last_reflection else "Unknown")
+        forced_final = await self.reflector.force_answer(
+            query,
+            current_query,
+            turn_results if 'turn_results' in locals() else [],
+            all_evidences,
+        )
+        final_ans = (
+            forced_final.get("final_answer")
+            or (last_reflection.get("final_answer") if last_reflection else None)
+            or "Unknown"
+        )
+        final_thought = (
+            forced_final.get("thought")
+            or (last_reflection.get("thought") if last_reflection else None)
+        )
         # persist trace: one line per request with id first
         try:
-            import json
-            os.makedirs(self.storage_dir, exist_ok=True)
-            trace_path = os.path.join(self.storage_dir, "query_traces.jsonl")
-            with open(trace_path, "a", encoding="utf-8") as tf:
-                rid = str(request_id) if request_id is not None else "unknown"
-                # write JSON object with id first, then queries list
-                ordered = {"id": rid, "queries": trace_queries}
-                tf.write(json.dumps(ordered, ensure_ascii=False) + "\n")
+            self._persist_query_traces(request_id, trace_queries, turn_trace_details)
         except Exception:
             logger.warning("Failed to write query trace")
         return {
             "query": query,
-            "answer": "Max turns reached. Partial answer: " + (final_ans or "Unknown"),
+            "answer": final_ans,
             "evidences": all_evidences,
-            "thought": reflection.get("thought"),
+            "thought": final_thought,
             "doc_ids": list(all_doc_ids),
             "turns": turn,
-            "ontology_traces": ontology_traces,
         }
+
+    def _persist_query_traces(
+        self,
+        request_id: Optional[str],
+        trace_queries: List[str],
+        turn_trace_details: List[Dict[str, Any]],
+    ) -> None:
+        os.makedirs(self.storage_dir, exist_ok=True)
+        rid = str(request_id) if request_id is not None else "unknown"
+
+        trace_path = os.path.join(self.storage_dir, "query_traces.jsonl")
+        with open(trace_path, "a", encoding="utf-8") as tf:
+            ordered = {"id": rid, "queries": trace_queries}
+            tf.write(json.dumps(ordered, ensure_ascii=False) + "\n")
+
+        detail_trace_path = os.path.join(self.storage_dir, "query_turn_details.jsonl")
+        with open(detail_trace_path, "a", encoding="utf-8") as tf:
+            ordered = {"id": rid, "turns": turn_trace_details}
+            tf.write(json.dumps(ordered, ensure_ascii=False) + "\n")

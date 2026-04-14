@@ -11,6 +11,26 @@ class Reflector:
     def __init__(self, llm_client: BaseLLMClient):
         self.llm_client = llm_client
 
+    def _build_payload(
+        self,
+        original_query: str,
+        current_query: str,
+        verifier_results: List[Dict[str, Any]],
+        accumulated_evidences: List[str]
+    ) -> Dict[str, Any]:
+        return {
+            "original_query": original_query,
+            "current_query": current_query,
+            "accumulated_evidences": accumulated_evidences,
+            "sub_queries_status": [
+                {
+                    "q": res["sub_query"],
+                    "facts": res.get("evidences_chain", [])
+                }
+                for res in verifier_results
+            ]
+        }
+
     async def reflect(
         self,
         original_query: str,
@@ -23,19 +43,12 @@ class Reflector:
         and proposing a new_query that better targets remaining gaps.
         """
         system_prompt = PromptManager.get_prompt('REFLECTOR_SYSTEM')
-
-        payload = {
-            "original_query": original_query,
-            "current_query": current_query,
-            "accumulated_evidences": accumulated_evidences,
-            "sub_queries_status": [
-                {
-                    "q": res["sub_query"],
-                    "facts": res.get("evidences_chain", [])
-                }
-                for res in verifier_results
-            ]
-        }
+        payload = self._build_payload(
+            original_query,
+            current_query,
+            verifier_results,
+            accumulated_evidences,
+        )
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -52,3 +65,39 @@ class Reflector:
         except Exception as e:
             logger.error(f"Reflection failed: {e}")
             return {"answered": False, "new_query": current_query}
+
+    async def force_answer(
+        self,
+        original_query: str,
+        current_query: str,
+        verifier_results: List[Dict[str, Any]],
+        accumulated_evidences: List[str]
+    ) -> Dict[str, Any]:
+        system_prompt = PromptManager.get_prompt('REFLECTOR_FINAL_SYSTEM')
+        payload = self._build_payload(
+            original_query,
+            current_query,
+            verifier_results,
+            accumulated_evidences,
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+        ]
+
+        try:
+            response_text = await self.llm_client.chat(messages, response_format={"type": "json_object"})
+            data = parse_llm_json(response_text)
+            if not data:
+                return {
+                    "final_answer": "Unable to determine a complete answer from the retrieved evidence.",
+                    "thought": "No valid JSON was returned during forced final synthesis.",
+                }
+            return data
+        except Exception as e:
+            logger.error(f"Forced final answer synthesis failed: {e}")
+            return {
+                "final_answer": "Unable to determine a complete answer from the retrieved evidence.",
+                "thought": f"Forced final synthesis failed: {e}",
+            }

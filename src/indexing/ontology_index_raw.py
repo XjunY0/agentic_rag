@@ -13,7 +13,6 @@ from ..utils.logger import setup_logger
 from ..models.base import BaseLLMClient, BaseEmbeddingModel
 from ..prompts.manager import PromptManager
 from ..utils.helpers import parse_llm_json
-from ..utils.visualize_ontology import generate_html
 
 logger = setup_logger(__name__)
 
@@ -96,23 +95,6 @@ class TreeNode:
         for child_data in data.get("children", []):
             node.add_child(TreeNode.from_dict(child_data, node))
         return node
-
-
-def format_node_for_prompt(
-    node: TreeNode,
-    include_desc: bool = False,
-    node_similarity: Optional[float] = None,
-) -> str:
-    lines = [
-        f"node_id: {node.node_id}",
-        f"concept_path: {node.concept_path()}",
-        f"attached_doc_count: {len(node.doc_ids)}",
-    ]
-    if node_similarity is not None:
-        lines.append(f"node_similarity: {node_similarity:.4f}")
-    if include_desc and node.desc:
-        lines.append(f"semantic_definition: {node.desc}")
-    return "\n   ".join(lines)
 
 class FaissNodeIndex:
     def __init__(self, dim: int, M: int = 32):
@@ -237,14 +219,9 @@ class VectorClassifier:
         async with lock:
             self.index.add_nodes_with_vectors(new_nodes, vecs)
 
-    async def _llm_filter_nodes(
-        self,
-        doc_text: str,
-        candidates: List[TreeNode],
-    ) -> List[str]:
-        include_desc = bool(self.config.get("include_desc_in_mount_prompt", True))
+    async def _llm_filter_nodes(self, doc_text: str, candidates: List[TreeNode]) -> List[str]:
         nodes_text = "\n".join(
-            "- " + format_node_for_prompt(n, include_desc=include_desc)
+            f"- node_id: {n.node_id}\n  concept_chain: {n.concept_path()}"
             for n in candidates
         )
         prompt = PromptManager.get_prompt('PROMPT_FILTER_NODES').format(
@@ -371,7 +348,7 @@ class VectorClassifier:
                 await fut
             except Exception as e:
                 logger.error(f"Error processing doc: {e}")
-
+        
         pending = [t for t in self._split_tasks.values() if t and not t.done()]
         if pending:
             await asyncio.gather(*pending)
@@ -383,82 +360,11 @@ class OntologyIndex:
         self.root = TreeNode("Root", 1)
         self.search_index = None
         self.search_node_ids = []
-        self.doc_ids: List[str] = []
-        self.doc_id_to_idx: Dict[str, int] = {}
-        self.doc_vecs: Optional[np.ndarray] = None
-
-    def _cache_runtime_doc_data(self, corpus: List[Dict[str, Any]], doc_vecs: Optional[Any]):
-        self.doc_ids = [str(doc["id"]) for doc in corpus]
-        self.doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(self.doc_ids)}
-        if doc_vecs is None:
-            self.doc_vecs = None
-            return
-
-        vecs = np.ascontiguousarray(np.asarray(doc_vecs, dtype="float32"))
-        if vecs.ndim != 2 or vecs.shape[0] != len(self.doc_ids):
-            logger.warning(
-                "Skipping ontology runtime doc-vector cache due to shape mismatch: "
-                f"vecs={getattr(vecs, 'shape', None)} docs={len(self.doc_ids)}"
-            )
-            self.doc_vecs = None
-            return
-
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        if np.any((norms > 0) & (np.abs(norms - 1.0) > 1e-3)):
-            vecs = vecs / np.clip(norms, 1e-12, None)
-        self.doc_vecs = vecs
-
-    def _score_docs_for_node(
-        self,
-        query_vec: np.ndarray,
-        node: TreeNode,
-        node_relevance: float,
-        node_similarity: float,
-        max_docs_per_node: int,
-        doc_similarity_weight: float,
-        node_similarity_weight: float,
-    ) -> List[Dict[str, Any]]:
-        if not node.doc_ids:
-            return []
-
-        doc_sims: Dict[str, float] = {}
-        if self.doc_vecs is not None and self.doc_id_to_idx:
-            valid_pairs = [(did, self.doc_id_to_idx.get(did)) for did in node.doc_ids]
-            valid_pairs = [(did, idx) for did, idx in valid_pairs if idx is not None]
-            if valid_pairs:
-                indices = [idx for _, idx in valid_pairs]
-                sims = np.dot(self.doc_vecs[indices], query_vec[0])
-                doc_sims = {
-                    did: float(sim)
-                    for (did, _), sim in zip(valid_pairs, sims)
-                }
-
-        scored_docs = []
-        for did in node.doc_ids:
-            doc_sim = max(0.0, doc_sims.get(did, 0.0))
-            score = (
-                float(node_relevance)
-                + doc_similarity_weight * doc_sim
-                + node_similarity_weight * max(0.0, float(node_similarity))
-            )
-            scored_docs.append({
-                "id": did,
-                "score": float(score),
-                "node_id": node.node_id,
-                "concept_path": node.concept_path(),
-                "node_relevance": float(node_relevance),
-                "node_similarity": float(node_similarity),
-                "doc_similarity": float(doc_sim),
-            })
-
-        scored_docs.sort(key=lambda x: x["score"], reverse=True)
-        return scored_docs[:max_docs_per_node]
 
     async def build(self, corpus: List[Dict[str, Any]], llm: BaseLLMClient, embedder: BaseEmbeddingModel, doc_vecs: Optional[Any] = None, force: bool = False):
         if os.path.exists(self.index_path) and not force:
             logger.info(f"Ontology index already exists at {self.index_path}. Skipping build.")
             self.load()
-            self._cache_runtime_doc_data(corpus, doc_vecs)
             return
 
         logger.info(f"Building Ontology index at {self.index_path}...")
@@ -555,8 +461,6 @@ class OntologyIndex:
             faiss.normalize_L2(vecs)
             self.search_index = faiss.IndexFlatIP(vecs.shape[1])
             self.search_index.add(vecs)
-
-        self._cache_runtime_doc_data(corpus, doc_vecs)
         
         self.save()
         if classifier.index:
@@ -574,14 +478,6 @@ class OntologyIndex:
             
             if self.search_index:
                 faiss.write_index(self.search_index, self.index_path + ".search.faiss")
-                
-        # Generate visualization
-        html_path = os.path.splitext(self.index_path)[0] + ".html"
-        try:
-            generate_html(self.index_path, html_path)
-            logger.info(f"Ontology visualization saved to {html_path}")
-        except Exception as e:
-            logger.error(f"Failed to generate ontology visualization: {e}")
 
     def load(self):
         with open(self.index_path, "r", encoding="utf-8") as f:
@@ -614,10 +510,10 @@ class OntologyIndex:
         dfs(self.root)
         return nodes
 
-    async def search(self, query: str, embedder: BaseEmbeddingModel, llm: BaseLLMClient, top_k_nodes: int = 20) -> Dict[str, Any]:
+    async def search(self, query: str, embedder: BaseEmbeddingModel, llm: BaseLLMClient, top_k_nodes: int = 20) -> List[Dict[str, Any]]:
         """Search for relevant documents via ontology nodes."""
         if not self.search_index or not self.search_node_ids:
-            return {"results": [], "trace": None}
+            return []
         
         encode_fn = getattr(embedder, "encode_async", None)
         if encode_fn is None:
@@ -630,25 +526,16 @@ class OntologyIndex:
         scores, indices = self.search_index.search(query_vec, min(top_k_nodes, len(self.search_node_ids)))
         
         all_nodes = {n.node_id: n for n in self.get_all_nodes()}
-        candidate_entries = []
-        for rank, (node_score, idx) in enumerate(zip(scores[0], indices[0]), start=1):
+        candidates = []
+        for idx in indices[0]:
             if idx != -1 and idx < len(self.search_node_ids):
                 nid = self.search_node_ids[idx]
                 if nid in all_nodes:
-                    candidate_entries.append({
-                        "rank": rank,
-                        "node": all_nodes[nid],
-                        "node_similarity": float(node_score),
-                    })
+                    candidates.append(all_nodes[nid])
         
-        if not candidate_entries:
-            return {"results": [], "trace": None}
+        if not candidates: return []
         
-        include_desc = bool(self.config.get("include_desc_in_search_prompt", True))
-        concept_lines = [
-            f"{entry['rank']}. {format_node_for_prompt(entry['node'], include_desc=include_desc, node_similarity=entry['node_similarity'])}"
-            for entry in candidate_entries
-        ]
+        concept_lines = [f"{i+1}. node_id: {n.node_id}\n   concept_path: {n.concept_path()}" for i, n in enumerate(candidates)]
         concepts_text = "\n".join(concept_lines)
         
         prompt = PromptManager.get_prompt('ONTOLOGY_RELEVANCE_USER').format(query=query, concepts_text=concepts_text)
@@ -660,86 +547,19 @@ class OntologyIndex:
             res_text = await llm.chat(messages, response_format={"type": "json_object"})
             relevance_map = parse_llm_json(res_text)
             if not relevance_map:
-                return {"results": [], "trace": None}
+                return []
 
             relevance2score = {"strong": 2, "weak": 1, "none": 0}
-            max_docs_per_node = int(self.config.get("search_max_docs_per_node", 8))
-            doc_similarity_weight = float(self.config.get("search_doc_similarity_weight", 1.0))
-            node_similarity_weight = float(self.config.get("search_node_similarity_weight", 0.15))
+            doc_scores = {}
 
-            doc_scores: Dict[str, Dict[str, Any]] = {}
-            node_map = {entry["node"].node_id: entry for entry in candidate_entries}
-            selected_nodes = []
+            node_map = {n.node_id: n for n in candidates}
             for nid, rel in relevance_map.items():
                 score = relevance2score.get(rel.lower().strip(), 0)
                 if score > 0 and nid in node_map:
-                    entry = node_map[nid]
-                    node = entry["node"]
-                    selected_nodes.append({
-                        "node_id": node.node_id,
-                        "concept_path": node.concept_path(),
-                        "node_similarity": float(entry["node_similarity"]),
-                        "llm_relevance": rel.lower().strip(),
-                        "doc_count": len(node.doc_ids),
-                    })
-                    for doc_res in self._score_docs_for_node(
-                        query_vec=query_vec,
-                        node=node,
-                        node_relevance=float(score),
-                        node_similarity=float(entry["node_similarity"]),
-                        max_docs_per_node=max_docs_per_node,
-                        doc_similarity_weight=doc_similarity_weight,
-                        node_similarity_weight=node_similarity_weight,
-                    ):
-                        did = doc_res["id"]
-                        prev = doc_scores.get(did)
-                        if prev is None or doc_res["score"] > prev["score"]:
-                            doc_scores[did] = doc_res
+                    for did in node_map[nid].doc_ids:
+                        doc_scores[did] = max(doc_scores.get(did, 0), score)
 
-            ranked_docs = sorted(doc_scores.values(), key=lambda x: x["score"], reverse=True)
-            results = [
-                {
-                    "id": item["id"],
-                    "score": float(item["score"]),
-                    "node_id": item["node_id"],
-                    "concept_path": item["concept_path"],
-                    "node_relevance": item["node_relevance"],
-                    "node_similarity": item["node_similarity"],
-                    "doc_similarity": item["doc_similarity"],
-                }
-                for item in ranked_docs
-            ]
-
-            trace = None
-            if self.config.get("search_trace_enabled", True):
-                trace = {
-                    "query_preview": query[:200],
-                    "top_k_nodes": int(top_k_nodes),
-                    "candidate_nodes": [
-                        {
-                            "rank": entry["rank"],
-                            "node_id": entry["node"].node_id,
-                            "concept_path": entry["node"].concept_path(),
-                            "desc": entry["node"].desc,
-                            "doc_count": len(entry["node"].doc_ids),
-                            "node_similarity": float(entry["node_similarity"]),
-                            "llm_relevance": relevance_map.get(entry["node"].node_id, "none"),
-                        }
-                        for entry in candidate_entries
-                    ],
-                    "selected_nodes": selected_nodes,
-                    "returned_docs": [
-                        {
-                            "id": item["id"],
-                            "score": float(item["score"]),
-                            "node_id": item["node_id"],
-                            "doc_similarity": float(item["doc_similarity"]),
-                        }
-                        for item in ranked_docs[: min(len(ranked_docs), 20)]
-                    ],
-                }
-
-            return {"results": results, "trace": trace}
+            return [{"id": did, "score": float(score)} for did, score in doc_scores.items()]
         except Exception as e:
             logger.error(f"Ontology search failed: {e}")
-            return {"results": [], "trace": None}
+            return []

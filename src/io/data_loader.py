@@ -1,7 +1,7 @@
 import os
 import glob
 from typing import List, Dict, Any
-from ..utils.helpers import read_jsonl, write_jsonl, load_json, save_json
+from ..utils.helpers import read_jsonl, write_jsonl, append_jsonl, load_json, save_json
 
 class DataLoader:
     def __init__(self, dataset_dir: str):
@@ -70,5 +70,11 @@ class DataLoader:
         path = os.path.join(self.dataset_dir, "relevance.jsonl")
         return read_jsonl(path)
 
+    def load_results(self, output_path: str) -> List[Dict[str, Any]]:
+        return read_jsonl(output_path)
+
     def save_results(self, results: List[Dict[str, Any]], output_path: str):
         write_jsonl(output_path, results)
+
+    def append_result(self, result: Dict[str, Any], output_path: str):
+        append_jsonl(output_path, result)

@@ -91,6 +91,7 @@ class TreeBuilder:
         min_docs_to_split: int = 100,
         concurrency: int = 16,
         sample_docs_for_split: int = 10,
+        route_threshold: float = 0.45,
     ):
         self.llm = llm
         self.embedder = embedder
@@ -99,6 +100,7 @@ class TreeBuilder:
         self.max_cluster_k = max_cluster_k
         self.min_docs_to_split = min_docs_to_split
         self.sample_docs_for_split = sample_docs_for_split
+        self.route_threshold = route_threshold
         # Semaphore created lazily per event loop to avoid binding to wrong loop
         self._sem = None
         self._concurrency = concurrency
@@ -145,7 +147,7 @@ class TreeBuilder:
 
         # 1. Clustering
         labels, _ = KMeans(raw_k).run(X)
-        reps = Selector.medoids(X, labels, top_k=min(self.sample_docs_for_split, 8))
+        reps = Selector.medoids(X, labels, top_k=min(self.sample_docs_for_split, 12))
         cluster_sizes = {
             int(cid): int(np.sum(labels == cid))
             for cid in np.unique(labels)
@@ -200,7 +202,7 @@ class TreeBuilder:
         encode_fn = getattr(self.embedder, "encode_async", None)
         cat_embs_list = []
         for i in tqdm(range(len(cat_names)), desc="Embedding topic names"):
-            text = f"{cat_names[i]} — {cat_descs[i]}"
+            text = f"{parent_path} > {cat_names[i]} — {cat_descs[i]}"
             if encode_fn is None:
                 emb = await asyncio.to_thread(self.embedder.encode, [text])
             else:
@@ -209,7 +211,7 @@ class TreeBuilder:
         cat_embs = np.vstack(cat_embs_list)
         faiss.normalize_L2(cat_embs)
 
-        assignment, _ = Router.route(X, cat_embs)
+        assignment, _ = Router.route(X, cat_embs, threshold=self.route_threshold)
         valid_child_ids = [cid for cid in range(len(cat_names)) if np.any(assignment == cid)]
         if len(valid_child_ids) <= 1:
             node.doc_ids = ids
